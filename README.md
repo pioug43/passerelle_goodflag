@@ -439,14 +439,3 @@ Workflow Manager v1.19.4 :
   - Page de consentement (format: `cop_xxx`)
   - Profil de signature (format: `sip_xxx`)
 
-## Documentation complémentaire
-
-| Document | Contenu |
-|----------|---------|
-| [Guide d'intégration Publik](docs/guide_integration_publik.md) | Configuration W.C.S., appels webservice, variables, exemples d'import |
-| [Guide développeur](docs/guide_developpeur.md) | Structure du code, conventions, comment étendre le connecteur |
-| [Guide d'exploitation](docs/guide_exploitation.md) | Administration, supervision, troubleshooting |
-| [API Goodflag](docs/api_goodflag.md) | Référence API Goodflag Workflow Manager v1.19.4 |
-| [Intégration Goodflag](docs/integration_goodflag.md) | Guide d'intégration officiel Goodflag |
-| [Documentation Publik](docs/dev_publik.md) | Liens vers la documentation officielle Publik/W.C.S. |
-| [Roadmap](docs/ROADMAP.md) | Évolutions identifiées classées immédiat / proche / lointain |

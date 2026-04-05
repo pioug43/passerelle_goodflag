@@ -1,0 +1,91 @@
+<?xml version="1.0" ?>
+<formdef id="" url="">
+  <name>Demande de signature électronique</name>
+  <url_name>signature-electronique</url_name>
+  <description>Formulaire de dépôt d'un document PDF pour signature électronique via Goodflag</description>
+  <workflow slug="workflow-signature-goodflag">Workflow signature Goodflag</workflow>
+  <fields>
+    <field>
+      <type>title</type>
+      <label type="str">Document à signer</label>
+      <varname type="str"></varname>
+      <id type="str">1</id>
+    </field>
+    <field>
+      <type>file</type>
+      <label type="str">Document PDF à signer</label>
+      <required type="str">required</required>
+      <varname type="str">document_pdf</varname>
+      <hint type="str">Seuls les fichiers PDF sont acceptés (taille maximale : 50 Mo)</hint>
+      <display_locations>
+        <item>validation</item>
+        <item>summary</item>
+      </display_locations>
+      <id type="str">2</id>
+    </field>
+    <field>
+      <type>title</type>
+      <label type="str">Signataire</label>
+      <varname type="str"></varname>
+      <id type="str">3</id>
+    </field>
+    <field>
+      <type>string</type>
+      <label type="str">Prénom du signataire</label>
+      <required type="str">required</required>
+      <varname type="str">prenom_signataire</varname>
+      <display_locations>
+        <item>validation</item>
+        <item>summary</item>
+      </display_locations>
+      <id type="str">4</id>
+    </field>
+    <field>
+      <type>string</type>
+      <label type="str">Nom du signataire</label>
+      <required type="str">required</required>
+      <varname type="str">nom_signataire</varname>
+      <display_locations>
+        <item>validation</item>
+        <item>summary</item>
+      </display_locations>
+      <id type="str">5</id>
+    </field>
+    <field>
+      <type>email</type>
+      <label type="str">Adresse email du signataire</label>
+      <required type="str">required</required>
+      <varname type="str">email_signataire</varname>
+      <hint type="str">Le signataire recevra une invitation à signer à cette adresse</hint>
+      <display_locations>
+        <item>validation</item>
+        <item>summary</item>
+      </display_locations>
+      <id type="str">6</id>
+    </field>
+    <field>
+      <type>string</type>
+      <label type="str">Téléphone portable du signataire</label>
+      <required type="bool">False</required>
+      <varname type="str">telephone_portable</varname>
+      <hint type="str">Format international requis (ex : +33612345678) pour l'authentification par SMS</hint>
+      <display_locations>
+        <item>validation</item>
+        <item>summary</item>
+      </display_locations>
+      <id type="str">8</id>
+    </field>
+    <field>
+      <type>string</type>
+      <label type="str">Objet / intitulé du document</label>
+      <required type="str">required</required>
+      <varname type="str">objet_document</varname>
+      <hint type="str">Ex : Convention de stage 2024-001</hint>
+      <display_locations>
+        <item>validation</item>
+        <item>summary</item>
+      </display_locations>
+      <id type="str">7</id>
+    </field>
+  </fields>
+</formdef>

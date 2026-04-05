@@ -1,0 +1,318 @@
+<?xml version="1.0" ?>
+<workflow>
+  <name>Workflow signature Goodflag</name>
+  <slug>workflow-signature-goodflag</slug>
+  <description>Workflow de signature électronique via le connecteur Passerelle Goodflag.
+Pattern Esup-Signature (Avignon) : stockage des réponses webservice dans
+des champs backoffice, un seul statut d'attente qui vérifie le statut
+à chaque entrée et reboucle via timeout.</description>
+  <possible_status>
+
+    <status>
+      <id>just_submitted</id>
+      <name>Nouveau</name>
+      <items>
+        <item type="jump" id="1">
+          <status>creation-goodflag</status>
+          <mode>immediate</mode>
+        </item>
+      </items>
+    </status>
+
+    <status>
+      <id>creation-goodflag</id>
+      <name>Création du workflow Goodflag</name>
+      <items>
+
+        <!--
+          Appel unique submit-workflow : crée le workflow, uploade le document
+          et démarre les invitations en une seule requête Passerelle.
+          Paramètres :
+            - name           : intitulé du document (affiché dans Goodflag)
+            - recipient_*    : coordonnées du signataire
+            - external_ref   : numéro de demande Publik (pour corrélation)
+            - file           : objet fichier WCS ({{ form_var_document_pdf }})
+                               contient filename, content_type et content (base64)
+
+          Réponse : goodflag_submit_response_data_workflow_id
+                    goodflag_submit_response_data_status       (started)
+                    goodflag_submit_response_data_document_id
+        -->
+        <item type="webservice_call" id="2">
+          <method>POST</method>
+          <url>{{ passerelle_url }}passerelle-goodflag/goodflag/submit-workflow</url>
+          <post>False</post>
+          <post_data>
+            <item>
+              <name>name</name>
+              <value>{{ form_var_objet_document }}</value>
+            </item>
+            <item>
+              <name>recipient_email</name>
+              <value>{{ form_var_email_signataire }}</value>
+            </item>
+            <item>
+              <name>recipient_firstname</name>
+              <value>{{ form_var_prenom_signataire }}</value>
+            </item>
+            <item>
+              <name>recipient_lastname</name>
+              <value>{{ form_var_nom_signataire }}</value>
+            </item>
+            <item>
+              <name>recipient_phone</name>
+              <value>{{ form_var_telephone_portable }}</value>
+            </item>
+            <item>
+              <name>external_ref</name>
+              <value>{{ form_number }}</value>
+            </item>
+            <item>
+              <name>file</name>
+              <value>{{ form_var_document_pdf }}</value>
+            </item>
+          </post_data>
+          <response_type>json</response_type>
+          <varname>goodflag_submit</varname>
+          <action_on_app_error>:stop</action_on_app_error>
+          <action_on_4xx>:stop</action_on_4xx>
+          <action_on_5xx>:stop</action_on_5xx>
+        </item>
+
+        <!-- Enregistrement de l'ID workflow Goodflag dans un champ backoffice -->
+        <item type="set-backoffice-fields" id="20">
+          <fields>
+            <field>
+              <field_id>bo-goodflag-workflow-id</field_id>
+              <value>{{ goodflag_submit_response_data_workflow_id }}</value>
+            </field>
+          </fields>
+        </item>
+
+        <!-- Transition vers attente si workflow_id backoffice est rempli -->
+        <item type="jump" id="5">
+          <status>attente-signature</status>
+          <condition>
+            <type>django</type>
+            <value>form_var_goodflag_workflow_id</value>
+          </condition>
+          <mode>immediate</mode>
+          <set_marker_on_status>False</set_marker_on_status>
+        </item>
+
+        <item type="jump" id="6">
+          <status>erreur-technique</status>
+          <mode>immediate</mode>
+          <set_marker_on_status>False</set_marker_on_status>
+        </item>
+
+      </items>
+    </status>
+
+    <!--
+      Statut unique d'attente et vérification (pattern Avignon).
+      À chaque entrée :
+        1. Appel sync-status pour récupérer le statut Goodflag
+        2. Stockage du statut dans un champ backoffice persistant
+        3. Sauts conditionnels sur form_var_goodflag_status
+        4. Sinon, timeout 300s reboucle sur ce même statut
+    -->
+    <status>
+      <id>attente-signature</id>
+      <name>En attente de signature</name>
+      <items>
+
+        <!-- Appel sync-status à chaque entrée dans ce statut -->
+        <item type="webservice_call" id="7">
+          <method>GET</method>
+          <url>{{ passerelle_url }}passerelle-goodflag/goodflag/sync-status?workflow_id={{ form_var_goodflag_workflow_id }}&amp;external_ref={{ form_number }}</url>
+          <post>False</post>
+          <response_type>json</response_type>
+          <varname>goodflag_status</varname>
+          <action_on_app_error>:pass</action_on_app_error>
+          <action_on_4xx>:pass</action_on_4xx>
+          <action_on_5xx>:pass</action_on_5xx>
+        </item>
+
+        <!-- Enregistrement du statut dans un champ backoffice persistant -->
+        <item type="set-backoffice-fields" id="21">
+          <fields>
+            <field>
+              <field_id>bo-goodflag-status</field_id>
+              <value>{{ goodflag_status_response_data_status }}</value>
+            </field>
+          </fields>
+        </item>
+
+        <!-- Saut vers récupération si status == 'finished' -->
+        <item type="jump" id="8">
+          <status>recuperation-signe</status>
+          <condition>
+            <type>django</type>
+            <value>form_var_goodflag_status == "finished"</value>
+          </condition>
+          <mode>immediate</mode>
+          <set_marker_on_status>False</set_marker_on_status>
+        </item>
+
+        <!-- Saut vers refus si status == 'refused' -->
+        <item type="jump" id="9">
+          <status>signature-refusee</status>
+          <condition>
+            <type>django</type>
+            <value>form_var_goodflag_status == "refused"</value>
+          </condition>
+          <mode>immediate</mode>
+          <set_marker_on_status>False</set_marker_on_status>
+        </item>
+
+        <!--
+          Sinon : reboucle sur soi-même après 300s (polling de secours).
+          Le cron WCS trigger_jumps déclenche ce timeout.
+          Le callback webhook peut court-circuiter cette attente.
+        -->
+        <item type="jump" id="10">
+          <status>attente-signature</status>
+          <mode>timeout</mode>
+          <timeout>300</timeout>
+          <set_marker_on_status>False</set_marker_on_status>
+        </item>
+
+      </items>
+    </status>
+
+    <status>
+      <id>recuperation-signe</id>
+      <name>Récupération du document signé</name>
+      <items>
+
+        <item type="webservice_call" id="11">
+          <method>GET</method>
+          <url>{{ passerelle_url }}passerelle-goodflag/goodflag/download-signed-documents?workflow_id={{ form_var_goodflag_workflow_id }}&amp;external_ref={{ form_number }}</url>
+          <post>False</post>
+          <response_type>attachment</response_type>
+          <varname>document_signe</varname>
+          <action_on_app_error>:stop</action_on_app_error>
+          <action_on_4xx>:stop</action_on_4xx>
+          <action_on_5xx>:stop</action_on_5xx>
+        </item>
+
+        <item type="sendmail" id="12">
+          <to>{{ form_user_email }}</to>
+          <subject>Votre document a été signé - {{ form_var_objet_document }}</subject>
+          <body>Bonjour,
+
+Le document « {{ form_var_objet_document }} » (demande n° {{ form_number }}) a été signé par {{ form_var_prenom_signataire }} {{ form_var_nom_signataire }}.
+
+Vous pouvez le consulter dans votre espace personnel.
+
+Cordialement</body>
+        </item>
+
+        <item type="jump" id="13">
+          <status>termine</status>
+          <mode>immediate</mode>
+        </item>
+
+      </items>
+    </status>
+
+    <status>
+      <id>erreur-technique</id>
+      <name>Erreur technique</name>
+      <items>
+        <item type="sendmail" id="14">
+          <to>admin@exemple.fr</to>
+          <subject>[ERREUR] Signature électronique - {{ form_number }}</subject>
+          <body>Une erreur s'est produite lors de la création du workflow Goodflag pour la demande {{ form_number }}.
+
+Merci de vérifier les logs Passerelle.</body>
+        </item>
+      </items>
+    </status>
+
+    <status>
+      <id>signature-refusee</id>
+      <name>Signature refusée</name>
+      <items>
+        <item type="sendmail" id="15">
+          <to>{{ form_user_email }}</to>
+          <subject>Signature refusée - {{ form_var_objet_document }}</subject>
+          <body>Bonjour,
+
+La signature du document « {{ form_var_objet_document }} » (demande n° {{ form_number }}) a été refusée par {{ form_var_prenom_signataire }} {{ form_var_nom_signataire }}.
+
+Vous pouvez relancer la procédure depuis votre espace personnel.
+
+Cordialement</body>
+        </item>
+      </items>
+    </status>
+
+    <status>
+      <id>termine</id>
+      <name>Terminé</name>
+      <items/>
+    </status>
+
+  </possible_status>
+
+  <!--
+    Action globale : reçoit le callback du connecteur Goodflag.
+    Déclenche un saut immédiat vers attente-signature pour re-vérification.
+  -->
+  <global_actions>
+    <action>
+      <name>Notification signature Goodflag</name>
+      <items>
+        <item type="jump" id="100">
+          <status>attente-signature</status>
+          <mode>immediate</mode>
+          <set_marker_on_status>False</set_marker_on_status>
+        </item>
+      </items>
+      <triggers>
+        <trigger id="signature-callback" type="webservice">
+          <identifier>signature-callback</identifier>
+        </trigger>
+      </triggers>
+    </action>
+  </global_actions>
+
+  <!--
+    Champs backoffice : stockent les données Goodflag de manière persistante.
+    Accessibles via form_var_goodflag_workflow_id et form_var_goodflag_status
+    dans les conditions et templates du workflow.
+    Note : les id doivent correspondre aux field_id utilisés dans set-backoffice-fields.
+  -->
+  <backoffice-fields>
+    <formdef>
+      <name>-</name>
+      <fields>
+        <field>
+          <type>string</type>
+          <label type="str">Identifiant workflow Goodflag</label>
+          <required type="str">required</required>
+          <varname type="str">goodflag_workflow_id</varname>
+          <display_locations>
+            <item>summary</item>
+          </display_locations>
+          <anonymise type="str">final</anonymise>
+          <id type="str">bo-goodflag-workflow-id</id>
+        </field>
+        <field>
+          <type>string</type>
+          <label type="str">Statut signature Goodflag</label>
+          <required type="str">required</required>
+          <varname type="str">goodflag_status</varname>
+          <display_locations>
+            <item>summary</item>
+          </display_locations>
+          <anonymise type="str">final</anonymise>
+          <id type="str">bo-goodflag-status</id>
+        </field>
+      </fields>
+    </formdef>
+  </backoffice-fields>
+
+</workflow>

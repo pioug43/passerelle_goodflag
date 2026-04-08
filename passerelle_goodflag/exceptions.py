@@ -11,38 +11,28 @@ class GoodflagError(Exception):
 
 
 class GoodflagAuthError(GoodflagError):
-    """Erreur d'authentification (token invalide, expiré, etc.)."""
-
-    pass
+    """Token invalide, expiré, ou droits insuffisants."""
 
 
 class GoodflagNotFoundError(GoodflagError):
     """Ressource non trouvée côté Goodflag."""
 
-    pass
-
 
 class GoodflagValidationError(GoodflagError):
-    """Erreur de validation des paramètres."""
-
-    pass
+    """Paramètres d'entrée invalides."""
 
 
 class GoodflagTimeoutError(GoodflagError):
-    """Timeout lors d'un appel API Goodflag."""
-
-    pass
+    """Timeout lors d'un appel API."""
 
 
 class GoodflagUploadError(GoodflagError):
-    """Erreur lors de l'upload d'un document."""
-
-    pass
+    """Échec d'upload de document."""
 
 
 class GoodflagRateLimitError(GoodflagError):
-    """Rate limit atteint (HTTP 429). Utiliser retry_after pour patienter."""
+    """Rate limit atteint (HTTP 429)."""
 
     def __init__(self, message, retry_after=None, **kwargs):
         super().__init__(message, **kwargs)
-        self.retry_after = retry_after  # secondes à attendre avant de réessayer
+        self.retry_after = retry_after

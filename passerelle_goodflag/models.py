@@ -1,10 +1,5 @@
 """
-Modèle principal du connecteur Goodflag pour Passerelle.
-
-GoodflagResource : connecteur Passerelle (hérite de BaseResource)
-GoodflagWorkflowTrace : corrélation workflow Goodflag / demande Publik
-GoodflagWebhookEvent : journalisation des webhooks reçus
-GoodflagDocumentTrace : métadonnées des documents uploadés / signés
+Connecteur Passerelle pour la signature électronique Goodflag.
 """
 
 import base64
@@ -13,9 +8,9 @@ import io
 import ipaddress
 import json
 import logging
-import time
 import zipfile
-from urllib.parse import urlparse
+from datetime import timedelta
+from urllib.parse import unquote, urlparse
 
 from django.core.cache import cache
 from django.db import models
@@ -26,7 +21,7 @@ from django.utils.translation import gettext_lazy as _
 from passerelle.base.models import BaseResource
 from passerelle.utils.api import endpoint
 
-from .client import GoodflagClient, _sanitize_for_log
+from .client import GoodflagClient
 from .exceptions import (
     GoodflagError,
     GoodflagRateLimitError,
@@ -35,13 +30,9 @@ from .exceptions import (
 
 logger = logging.getLogger(__name__)
 
-# Statuts finaux d'un workflow Goodflag (utilisés dans hourly, sync_status, webhook)
 _FINAL_STATUSES = frozenset({'finished', 'refused'})
+_MAX_B64_LEN = int(50 * 1024 * 1024 * 4 / 3) + 1024  # ~50 Mo décodé
 
-# Taille max d'un fichier encodé en base64 (~50 Mo décodé)
-_MAX_B64_LEN = int(50 * 1024 * 1024 * 4 / 3) + 1024
-
-# Clés PII à masquer dans les logs debug
 _PII_KEYS = frozenset({
     'recipient_email', 'recipient_phone', 'recipient_firstname',
     'recipient_lastname', 'email', 'firstName', 'lastName',
@@ -51,12 +42,7 @@ _PII_KEYS = frozenset({
 
 
 def _sniff_content_type(content, declared_type):
-    """
-    Détecte le type MIME réel d'un fichier par ses magic bytes.
-
-    WCS renvoie souvent Content-Type: text/html ou application/octet-stream
-    même pour des PDFs valides. On se base sur le contenu réel.
-    """
+    """Détecte le type MIME réel par magic bytes (WCS déclare souvent un type incorrect)."""
     if content[:4] == b'%PDF':
         return 'application/pdf'
     if content[:4] == b'PK\x03\x04':
@@ -70,18 +56,7 @@ def _sniff_content_type(content, declared_type):
 
 
 def _validate_file_url(url):
-    """
-    Valide qu'une URL de fichier ne pointe pas vers une ressource interne
-    (protection contre les attaques SSRF).
-
-    Rejette :
-    - Schémas non-HTTP (file://, ftp://, gopher://, etc.)
-    - Adresses IP privées / loopback / link-local / réservées
-    - Hostname résolu vers une adresse privée (non vérifié ici — résolution DNS
-      hors scope, mais le schéma et la forme littérale sont contrôlés)
-
-    Lève GoodflagValidationError si l'URL est suspecte.
-    """
+    """Rejette les URLs pointant vers des ressources internes (SSRF)."""
     if not url:
         raise GoodflagValidationError("file_url is required")
     parsed = urlparse(url)
@@ -90,7 +65,6 @@ def _validate_file_url(url):
             f"file_url scheme '{parsed.scheme}' not allowed (http/https only)"
         )
     hostname = parsed.hostname or ''
-    # Rejeter les IP littérales privées / réservées
     try:
         addr = ipaddress.ip_address(hostname)
         if (addr.is_private or addr.is_loopback or addr.is_link_local
@@ -99,9 +73,7 @@ def _validate_file_url(url):
                 f"file_url points to a non-routable address: {hostname}"
             )
     except ValueError:
-        # Nom de domaine — on accepte, la résolution DNS n'est pas contrôlée ici
-        pass
-    # Rejeter les hostnames clairement locaux
+        pass  # nom de domaine, pas une IP littérale
     local_patterns = ('localhost', '127.', '0.0.0.0', '::1', 'metadata.google',
                       '169.254.', 'metadata.internal')
     for pat in local_patterns:
@@ -112,34 +84,20 @@ def _validate_file_url(url):
 
 
 def _validate_file_content(content, content_type):
-    """
-    Valide le contenu d'un fichier avant upload vers Goodflag.
-
-    Vérifie :
-    - PDF : signature magique, absence de chiffrement, non vide
-    - DOCX : signature ZIP (PK\\x03\\x04), fichier word/_rels/document.xml.rels présent
-    - Taille non nulle
-
-    Lève GoodflagValidationError si le fichier est invalide.
-    """
+    """Valide le contenu du fichier (magic bytes, chiffrement PDF, structure DOCX)."""
     if not content:
         raise GoodflagValidationError("Le fichier est vide")
 
-    # Détection du type réel par magic bytes, indépendamment du content_type déclaré.
-    # WCS peut servir un PDF avec Content-Type: application/octet-stream.
     is_pdf_by_content = content.startswith(b'%PDF')
     is_pdf_by_type = 'pdf' in content_type.lower()
 
     if is_pdf_by_content or is_pdf_by_type:
-        # Si le type déclaré dit PDF mais que les bytes ne correspondent pas,
-        # c'est une erreur réelle (ex: HTML de login renvoyé à la place du fichier).
         if is_pdf_by_type and not is_pdf_by_content:
             raise GoodflagValidationError(
                 "Le fichier n'est pas un PDF valide (signature %PDF manquante). "
                 "Vérifiez que l'URL du document est accessible et retourne bien un PDF."
             )
-        # Détection PDF chiffré : cherche /Encrypt dans les 2048 premiers octets
-        # ou dans les 512 derniers (où se trouve souvent le trailer)
+        # /Encrypt dans le header ou le trailer PDF => chiffrement
         probe = content[:2048] + content[-512:]
         if b'/Encrypt' in probe:
             raise GoodflagValidationError(
@@ -149,12 +107,10 @@ def _validate_file_content(content, content_type):
             )
 
     elif 'wordprocessingml' in content_type or 'docx' in content_type.lower():
-        # Vérification signature ZIP (DOCX = ZIP)
         if not content.startswith(b'PK\x03\x04'):
             raise GoodflagValidationError(
                 "Le fichier DOCX n'est pas valide (signature ZIP manquante)"
             )
-        # Vérification structure interne DOCX minimale
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as zf:
                 names = zf.namelist()
@@ -169,15 +125,7 @@ def _validate_file_content(content, content_type):
 
 
 class GoodflagResource(BaseResource):
-    """
-    Connecteur Passerelle pour la signature électronique Goodflag.
-
-    Permet à Publik (W.C.S.) de piloter un circuit de signature Goodflag :
-    création de workflow, upload de documents, démarrage, suivi, récupération
-    des documents signés.
-    """
-
-    # -- Champs de configuration ------------------------------------------
+    """Connecteur Passerelle pour la signature électronique Goodflag."""
 
     base_url = models.URLField(
         _('URL de base de l\'API Goodflag'),
@@ -323,36 +271,22 @@ class GoodflagResource(BaseResource):
         ),
     )
 
-    # -- Méta Passerelle --------------------------------------------------
-
     category = _('Connecteurs métiers')
 
     class Meta:
         verbose_name = _('Connecteur Goodflag (signature électronique)')
         verbose_name_plural = _('Connecteurs Goodflag (signature électronique)')
 
-    # -- Helpers -----------------------------------------------------------
-
-    # Paramètres d'authentification Passerelle injectés dans l'URL par W.C.S.
-    # — à exclure lors de la lecture des query params de données.
+    # Params d'auth Passerelle à exclure de la lecture du payload
     _PASSERELLE_AUTH_PARAMS = frozenset({'orig', 'algo', 'timestamp', 'nonce', 'signature'})
 
     def _parse_payload(self, request, **kwargs):
-        """
-        Combine toutes les sources de données en un seul dict.
-
-        Sources (par priorité décroissante) :
-        1. kwargs passés par Passerelle (paramètres extraits de l'URL)
-        2. JSON body (si content-type JSON ou body parseable)
-        3. Form-encoded body (request.POST)
-        4. Query string (request.GET) — hors params d'auth Passerelle
-        """
+        """Combine query string, body (JSON ou form-encoded) et kwargs en un seul dict."""
         content_type = request.content_type or ''
         body = request.body
 
         payload = {}
 
-        # 1. Lire la Query String (toujours utile)
         data_params = {
             k: v
             for k, v in request.GET.lists()
@@ -361,10 +295,6 @@ class GoodflagResource(BaseResource):
         for k, v in data_params.items():
             payload[k] = v[0] if len(v) == 1 else v
 
-        # 2. Lire le body (JSON ou Form-encoded)
-        # Les params d'auth Passerelle (orig, algo, timestamp, nonce, signature)
-        # peuvent être injectés dans le body par certains modes d'auth WCS —
-        # on les exclut comme on le fait pour la query string.
         if 'application/json' in content_type:
             try:
                 body_data = json.loads(body)
@@ -374,7 +304,6 @@ class GoodflagResource(BaseResource):
                         if k not in self._PASSERELLE_AUTH_PARAMS
                     })
             except (ValueError, TypeError):
-                # On ignore si c'est pas du JSON valide mais qu'on a déjà des params
                 if not payload:
                     raise GoodflagValidationError("Invalid JSON body")
         elif request.POST:
@@ -382,7 +311,6 @@ class GoodflagResource(BaseResource):
                 if k not in self._PASSERELLE_AUTH_PARAMS:
                     payload[k] = v[0] if len(v) == 1 else v
         elif body:
-            # Fallback JSON si body non vide
             try:
                 body_data = json.loads(body)
                 if isinstance(body_data, dict):
@@ -393,7 +321,6 @@ class GoodflagResource(BaseResource):
             except (ValueError, TypeError):
                 pass
 
-        # 3. Fusionner les kwargs de Passerelle (paramètres nommés dans l'URL)
         if kwargs:
             payload.update({k: v for k, v in kwargs.items() if v is not None})
 
@@ -408,7 +335,7 @@ class GoodflagResource(BaseResource):
 
     @staticmethod
     def _get_param(payload, key, default=None):
-        """Récupère un paramètre depuis un dict JSON ou form-encoded (liste)."""
+        """Récupère un paramètre, déplie les listes form-encoded."""
         val = payload.get(key, default)
         if isinstance(val, list):
             val = val[0] if val else default
@@ -417,7 +344,6 @@ class GoodflagResource(BaseResource):
         return val
 
     def _get_client(self):
-        """Retourne une instance du client Goodflag configurée."""
         return GoodflagClient(
             base_url=self.base_url,
             access_token=self.access_token,
@@ -426,27 +352,17 @@ class GoodflagResource(BaseResource):
         )
 
     def _log_debug(self, message, *args):
-        """Journalise en debug si le mode debug est activé."""
         if self.debug_mode:
             logger.info("[GOODFLAG DEBUG] " + message, *args)
 
     def _resolve_workflow_id(self, payload):
-        """
-        Résout le workflow_id depuis le payload.
-
-        Cherche d'abord workflow_id directement, puis utilise external_ref
-        comme fallback pour retrouver le workflow depuis la trace locale.
-        Cela permet de récupérer le workflow_id même si la variable WCS
-        goodflag_create_data_workflow_id n'a pas été correctement propagée.
-        """
+        """Résout workflow_id, avec fallback sur external_ref via la trace locale."""
         workflow_id = self._get_param(payload, 'workflow_id')
         if not workflow_id:
-            # Recherche de la référence externe dans plusieurs champs possibles (Publik)
             external_ref = (
                 self._get_param(payload, 'external_ref')
-                or self._get_param(payload, 'display_id')  # ex: "12-1"
-                or self._get_param(payload, 'uuid')        # ex: "a02ca561-..."
-                # Note: 'id' retiré — trop générique, risque de collision
+                or self._get_param(payload, 'display_id')
+                or self._get_param(payload, 'uuid')
             )
             if external_ref:
                 trace = GoodflagWorkflowTrace.objects.filter(
@@ -462,36 +378,22 @@ class GoodflagResource(BaseResource):
         return workflow_id
 
     def _build_steps(self, recipients, steps_config=None):
-        """
-        Construit la structure steps[] pour l'API Goodflag.
-
-        Si steps_config est fourni, il est utilisé tel quel (format natif
-        Goodflag). Sinon, on construit une étape de signature unique
-        à partir de la liste de recipients.
-
-        Chaque destinataire doit avoir au minimum un consentPageId et un
-        email. Si consentPageId manque, la valeur par défaut du connecteur
-        est utilisée.
-        """
+        """Construit la structure steps[] pour l'API Goodflag."""
         if steps_config:
-            # Format natif : on s'assure juste que consentPageId est présent
             for step in steps_config:
                 for recipient in step.get('recipients', []):
                     if not recipient.get('consentPageId') and self.default_consent_page_id:
                         recipient['consentPageId'] = self.default_consent_page_id
             return steps_config
 
-        # Construction simplifiée : une seule étape de type signature
         built_recipients = []
         for r in recipients:
             recipient = dict(r)
             if not recipient.get('consentPageId') and self.default_consent_page_id:
                 recipient['consentPageId'] = self.default_consent_page_id
-            # On supprime si c'est vide pour éviter erreur 400
             if 'consentPageId' in recipient and not recipient['consentPageId']:
                 del recipient['consentPageId']
-            
-            # Mapping phone (Publik) -> phoneNumber (Goodflag)
+
             phone = recipient.pop('phone', None)
             if phone:
                 recipient['phoneNumber'] = phone
@@ -510,22 +412,11 @@ class GoodflagResource(BaseResource):
         return steps
 
     def _parse_multi_recipients(self, payload):
-        """
-        Parse les destinataires au format form-encoded numéroté de W.C.S.
-
-        Supporte deux formats :
-        - Format indexé : recipients_0_email, recipients_0_firstname, ...,
-                          recipients_1_email, recipients_1_firstname, ...
-        - Format JSON  : recipients = [{"email": ..., "firstName": ...}, ...]
-
-        Retourne une liste de dicts recipients ou None si aucun trouvé.
-        """
-        # Format JSON (liste dans le payload)
+        """Parse les destinataires (format JSON ou indexé WCS : recipients_0_email, etc.)."""
         recipients_raw = payload.get('recipients')
         if recipients_raw and isinstance(recipients_raw, list):
             return recipients_raw
 
-        # Format indexé (form-encoded W.C.S.)
         _MAX_RECIPIENTS = 100
         recipients = []
         i = 0
@@ -550,22 +441,8 @@ class GoodflagResource(BaseResource):
 
         return recipients if recipients else None
 
-    # -- Parsing de fichier ------------------------------------------------
-
     def _parse_file_from_payload(self, payload, request):
-        """
-        Extrait le contenu d'un fichier depuis le payload ou la requête.
-
-        Priorité :
-          1. ``file`` (dict JSON) : {"filename": "...", "content_type": "...", "content": "<base64>"}
-          2. ``request.FILES['file']`` — upload multipart Django
-          3. ``file_base64`` — chaîne base64 directe
-          4. ``file_url`` — URL téléchargée via la session Passerelle signée
-          5. ``fields`` — objet de formulaire WCS complet (premier champ avec 'content')
-
-        Retourne (file_content: bytes, filename: str, content_type: str).
-        Lève GoodflagValidationError si aucune source n'est trouvable.
-        """
+        """Extrait le fichier depuis le payload (JSON, multipart, base64, URL ou fields WCS)."""
         file_obj = payload.get('file')
         if isinstance(file_obj, str) and file_obj.startswith('{'):
             try:
@@ -605,9 +482,6 @@ class GoodflagResource(BaseResource):
                     f"Failed to fetch file from URL: HTTP {resp.status_code}"
                 )
             file_content = resp.content
-            # Détection du type par magic bytes — prioritaire sur le Content-Type
-            # déclaré par WCS qui peut être text/html, application/octet-stream, etc.
-            # même pour un PDF valide.
             content_type = _sniff_content_type(file_content, content_type)
         elif isinstance(payload.get('fields'), dict):
             for field_val in payload['fields'].values():
@@ -625,14 +499,11 @@ class GoodflagResource(BaseResource):
         _validate_file_content(file_content, content_type)
 
         if not filename and file_url:
-            from urllib.parse import urlparse, unquote
             path = urlparse(file_url).path
             filename = unquote(path.rstrip('/').rsplit('/', 1)[-1]) or ''
         filename = filename or 'document.pdf'
 
         return file_content, filename, content_type
-
-    # -- Notification WCS --------------------------------------------------
 
     _NOTIFY_EVENT_TYPES = frozenset({
         'workflowFinished', 'workflowStopped', 'workflowStarted',
@@ -640,12 +511,7 @@ class GoodflagResource(BaseResource):
     })
 
     def _notify_wcs(self, workflow_id, event_type, normalized_status, event_id=''):
-        """
-        Notifie WCS d'un changement de statut via le publik_callback_url global.
-
-        Utilise self.requests (session Passerelle avec signature d'URL) pour
-        que WCS accepte l'appel.
-        """
+        """Notifie WCS d'un changement de statut via publik_callback_url."""
         callback_url = self.publik_callback_url
         if not callback_url:
             return
@@ -679,17 +545,15 @@ class GoodflagResource(BaseResource):
                 workflow_id, exc, callback_url,
             )
 
-    # -- Disponibilité et tâches planifiées --------------------------------
-
     def check_status(self):
-        """Vérifie la disponibilité de l'API Goodflag (toutes les 5 min)."""
+        """Vérifie la disponibilité de l'API Goodflag."""
         client = self._get_client()
         result = client.test_connection()
         if result.get('status') != 'ok':
             raise GoodflagError(result.get('message', 'Goodflag API unreachable'))
 
     def hourly(self):
-        """Synchronise les statuts des workflows actifs (draft/started)."""
+        """Synchronise les statuts des workflows actifs."""
         active_traces = GoodflagWorkflowTrace.objects.filter(
             resource=self,
             status__in=['draft', 'started'],
@@ -711,7 +575,6 @@ class GoodflagResource(BaseResource):
                     trace.status = new_status
                     trace.save(update_fields=['status', 'updated_at'])
 
-                    # Notifier WCS si transition vers un état final
                     if new_status in _FINAL_STATUSES and old_status not in _FINAL_STATUSES:
                         event_type = (
                             'workflowFinished' if new_status == 'finished'
@@ -723,12 +586,9 @@ class GoodflagResource(BaseResource):
             except GoodflagRateLimitError as exc:
                 wait = getattr(exc, 'retry_after', 60) or 60
                 logger.warning(
-                    "Hourly sync: rate limit hit for workflow %s, "
-                    "stopping sync for this run (retry_after=%ds)",
+                    "Hourly sync: rate limited on workflow %s (retry_after=%ds), stopping",
                     trace.goodflag_workflow_id, wait,
                 )
-                # Interrompre la boucle immédiatement : dormir bloquerait
-                # le worker Passerelle pour tous les autres connecteurs.
                 break
             except GoodflagError as exc:
                 logger.warning(
@@ -737,8 +597,7 @@ class GoodflagResource(BaseResource):
                 )
 
     def daily(self):
-        """Purge les anciennes traces (selon retention_days, défaut 90 jours)."""
-        from datetime import timedelta
+        """Purge les traces plus anciennes que retention_days."""
         limit = timezone.now() - timedelta(days=self.retention_days)
 
         wf_deleted, _ = GoodflagWorkflowTrace.objects.filter(
@@ -762,112 +621,28 @@ class GoodflagResource(BaseResource):
                 wf_deleted, wbe_deleted, doc_deleted,
             )
 
-    # -- Endpoints --------------------------------------------------------
-
-
     @endpoint(
         name='create-workflow',
         perm='can_access',
         methods=['post'],
-        description=_('Crée un workflow de signature Goodflag (statut draft, sans document)'),
+        description=_('Crée un workflow de signature Goodflag (statut draft)'),
         long_description=_(
-            'Crée un nouveau workflow Goodflag avec les signataires et métadonnées. '
-            'Le workflow est créé en statut "draft" : aucun document n\'est uploadé, '
-            'aucune invitation n\'est envoyée. Enchaîner avec upload-document puis '
-            'start-workflow, ou utiliser submit-workflow pour tout faire en un appel.\n\n'
-            'Format 1 — signataire unique (paramètres plats, form W.C.S.) :\n'
-            '{\n'
-            '  "name": "Signature convention {{ form_number }}",\n'
-            '  "recipient_email": "{{ form_var_email_signataire }}",\n'
-            '  "recipient_firstname": "{{ form_var_prenom_signataire }}",\n'
-            '  "recipient_lastname": "{{ form_var_nom_signataire }}",\n'
-            '  "recipient_phone": "{{ form_var_telephone_portable }}",\n'
-            '  "external_ref": "{{ form_number }}"\n'
-            '}\n\n'
-            'Format 2 — multi-signataires (liste JSON) :\n'
-            '{\n'
-            '  "name": "Convention multi-sig",\n'
-            '  "recipients": [\n'
-            '    {"email": "sig1@ex.com", "firstName": "Alice", "lastName": "Martin"},\n'
-            '    {"email": "sig2@ex.com", "firstName": "Bob", "lastName": "Dupont"}\n'
-            '  ],\n'
-            '  "external_ref": "{{ form_number }}"\n'
-            '}\n\n'
-            'Format 3 — steps natifs Goodflag (approbation + signature) :\n'
-            '{\n'
-            '  "name": "Approbation + Signature",\n'
-            '  "steps": [\n'
-            '    {"stepType": "approval", "recipients": [{"email": "resp@ex.com", '
-            '"firstName": "Chef", "lastName": "Service", "consentPageId": "cop_xxx"}]},\n'
-            '    {"stepType": "signature", "recipients": [{"email": "sig@ex.com", '
-            '"firstName": "Jean", "lastName": "Dupont", "consentPageId": "cop_yyy"}]}\n'
-            '  ],\n'
-            '  "external_ref": "{{ form_number }}"\n'
-            '}\n\n'
-            'Format 4 — multi-signataires indexé (form W.C.S. avec champs dynamiques) :\n'
-            '{\n'
-            '  "name": "...",\n'
-            '  "recipients_0_email": "sig1@ex.com",\n'
-            '  "recipients_0_firstname": "Alice",\n'
-            '  "recipients_1_email": "sig2@ex.com",\n'
-            '  "recipients_1_firstname": "Bob"\n'
-            '}\n\n'
-            'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "draft"}}'
+            'Crée un workflow en statut "draft". Accepte les signataires en format '
+            'plat (recipient_email), JSON (recipients: [...]), indexé WCS '
+            '(recipients_0_email) ou steps natifs Goodflag.'
         ),
         parameters={
-            'name': {
-                'description': _('Nom du workflow Goodflag'),
-                'example_value': 'Signature convention 2024-001',
-            },
-            'recipient_email': {
-                'description': _('Email du signataire unique (format plat)'),
-                'example_value': 'jean.dupont@example.com',
-            },
-            'recipient_firstname': {
-                'description': _('Prénom du signataire'),
-                'example_value': 'Jean',
-            },
-            'recipient_lastname': {
-                'description': _('Nom du signataire'),
-                'example_value': 'Dupont',
-            },
-            'recipient_phone': {
-                'description': _('Téléphone du signataire pour SMS 2FA (format: +33612345678)'),
-                'example_value': '+33612345678',
-            },
-            'external_ref': {
-                'description': _('Référence externe Publik — numéro de demande'),
-                'example_value': 'DEM-2024-001',
-            },
-            'recipients': {
-                'description': _(
-                    'Liste JSON de signataires : [{"email": "...", "firstName": "...", '
-                    '"lastName": "...", "phoneNumber": "...", "consentPageId": "cop_xxx"}]'
-                ),
-                'example_value': '[{"email": "sig@ex.com", "firstName": "Jean", "lastName": "Dupont"}]',
-            },
-            'steps': {
-                'description': _(
-                    'Steps natifs Goodflag : [{"stepType": "approval|signature", '
-                    '"recipients": [...], "maxInvites": 5}]'
-                ),
-                'example_value': '[{"stepType": "signature", "recipients": [{"email": "sig@ex.com", "firstName": "Jean", "lastName": "Dupont", "consentPageId": "cop_xxx"}]}]',
-            },
-            'metadata': {
-                'description': _(
-                    'Métadonnées Goodflag — champs data1 à data16 du mapping tenant. '
-                    'Requiert default_layout_id configuré sur le connecteur.'
-                ),
-                'example_value': '{"data1": "DEM-2024-001", "data2": "Service urbanisme", "data3": "{{ form_user_nameid }}"}',
-            },
-            'workflow_mode': {
-                'description': _('Mode du workflow (défaut: FULL)'),
-                'example_value': 'FULL',
-            },
-            'layout_id': {
-                'description': _('Layout Goodflag pour les métadonnées (défaut: valeur du connecteur)'),
-                'example_value': 'lay_abc123',
-            },
+            'name': {'description': _('Nom du workflow'), 'example_value': 'Signature convention 2024-001'},
+            'recipient_email': {'description': _('Email du signataire (format plat)'), 'example_value': 'jean.dupont@example.com'},
+            'recipient_firstname': {'description': _('Prénom du signataire'), 'example_value': 'Jean'},
+            'recipient_lastname': {'description': _('Nom du signataire'), 'example_value': 'Dupont'},
+            'recipient_phone': {'description': _('Téléphone 2FA (+33612345678)'), 'example_value': '+33612345678'},
+            'external_ref': {'description': _('Référence externe Publik'), 'example_value': 'DEM-2024-001'},
+            'recipients': {'description': _('Liste JSON de signataires')},
+            'steps': {'description': _('Steps natifs Goodflag (approval/signature)')},
+            'metadata': {'description': _('Métadonnées data1-data16 (nécessite default_layout_id)')},
+            'workflow_mode': {'description': _('Mode du workflow (défaut: FULL)'), 'example_value': 'FULL'},
+            'layout_id': {'description': _('Layout pour les métadonnées'), 'example_value': 'lay_abc123'},
         },
     )
     def create_workflow(self, request, **kwargs):
@@ -877,18 +652,13 @@ class GoodflagResource(BaseResource):
         if not name:
             raise GoodflagValidationError("'name' is required")
 
-        # Soit on fournit des steps natifs Goodflag, soit des recipients
-        # simplifiés (JSON) ou des paramètres plats (form W.C.S.)
         steps_config = payload.get('steps')
         recipients = payload.get('recipients')
 
-        # Multi-signataires (format indexé ou JSON) ou signataire unique (format plat)
         if not steps_config and not recipients:
-            # Essayer le format multi (recipients_0_email, recipients_1_email, ...)
             recipients = self._parse_multi_recipients(payload)
 
         if not steps_config and not recipients:
-            # Format plat : un seul signataire (recipient_email, ...)
             recipient_email = self._get_param(payload, 'recipient_email')
             if recipient_email:
                 recipients = [{
@@ -908,17 +678,10 @@ class GoodflagResource(BaseResource):
             steps_config=steps_config,
         )
 
-        # Métadonnées Publik -> champs data1-data16 Goodflag
         metadata = payload.get('metadata', {})
         external_ref = self._get_param(payload, 'external_ref', '')
-
-        # Layout pour les métadonnées
         layout_id = self._get_param(payload, 'layout_id') or self.default_layout_id
-
-        # Mode du workflow
         workflow_mode = self._get_param(payload, 'workflow_mode', 'FULL')
-
-        # Co-managers
         allowed_comanager_users = payload.get('allowed_comanager_users')
         comanager_notified_events = payload.get('comanager_notified_events')
 
@@ -951,7 +714,6 @@ class GoodflagResource(BaseResource):
                 "Goodflag API failed to return a workflow ID."
             )
 
-        # Persistance locale
         GoodflagWorkflowTrace.objects.update_or_create(
             resource=self,
             goodflag_workflow_id=workflow_id,
@@ -963,9 +725,6 @@ class GoodflagResource(BaseResource):
             },
         )
 
-        # Ne retourner que les champs essentiels (sans 'raw') pour éviter
-        # que WCS ait à analyser une réponse trop volumineuse qui peut
-        # empêcher la propagation correcte de goodflag_create_data_workflow_id.
         return {'data': {
             'workflow_id': workflow_id,
             'status': result.get('status', 'draft'),
@@ -975,129 +734,33 @@ class GoodflagResource(BaseResource):
         name='submit-workflow',
         perm='can_access',
         methods=['post'],
-        description=_('Crée, uploade le document et démarre un workflow Goodflag en un seul appel'),
+        description=_('Crée, uploade et démarre un workflow en un seul appel'),
         long_description=_(
-            'Enchaîne automatiquement : création du workflow (draft), upload du document PDF, '
-            'démarrage (envoi des invitations aux signataires). '
-            'Remplace les 3 appels séparés create-workflow + upload-document + start-workflow.\n\n'
-            'Exemple 1 — signataire unique avec fichier via URL (recommandé depuis W.C.S.) :\n'
-            '{\n'
-            '  "name": "Signature {{ form_var_objet_document }}",\n'
-            '  "recipient_email": "{{ form_var_email_signataire }}",\n'
-            '  "recipient_firstname": "{{ form_var_prenom_signataire }}",\n'
-            '  "recipient_lastname": "{{ form_var_nom_signataire }}",\n'
-            '  "recipient_phone": "{{ form_var_telephone_portable }}",\n'
-            '  "external_ref": "{{ form_number }}",\n'
-            '  "file_url": "{{ form_var_document_pdf_url }}",\n'
-            '  "filename": "{{ form_var_document_pdf_filename }}"\n'
-            '}\n\n'
-            'Exemple 2 — fichier encodé en base64 :\n'
-            '{\n'
-            '  "name": "Signature {{ form_number }}",\n'
-            '  "recipient_email": "{{ form_var_email_signataire }}",\n'
-            '  "external_ref": "{{ form_number }}",\n'
-            '  "file": {\n'
-            '    "filename": "convention.pdf",\n'
-            '    "content_type": "application/pdf",\n'
-            '    "content": "{{ form_var_document_pdf|base64_encode }}"\n'
-            '  }\n'
-            '}\n\n'
-            'Exemple 3 — multi-signataires avec métadonnées :\n'
-            '{\n'
-            '  "name": "Convention {{ form_number }}",\n'
-            '  "recipients": [\n'
-            '    {"email": "{{ form_var_email_sig1 }}", "firstName": "{{ form_var_prenom_sig1 }}", '
-            '"lastName": "{{ form_var_nom_sig1 }}"},\n'
-            '    {"email": "{{ form_var_email_sig2 }}", "firstName": "{{ form_var_prenom_sig2 }}", '
-            '"lastName": "{{ form_var_nom_sig2 }}"}\n'
-            '  ],\n'
-            '  "external_ref": "{{ form_number }}",\n'
-            '  "metadata": {"data1": "{{ form_number }}", "data2": "{{ form_var_service }}"},\n'
-            '  "file_url": "{{ form_var_document_pdf_url }}"\n'
-            '}\n\n'
-            'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "started", "document_id": "doc_xxx"}}'
+            'Enchaîne create-workflow + upload-document + start-workflow. '
+            'Le fichier peut être fourni via file_url, file (JSON base64), '
+            'file_base64 ou multipart.'
         ),
         parameters={
-            'name': {
-                'description': _('Nom du workflow Goodflag'),
-                'example_value': 'Signature convention 2024-001',
-            },
-            'recipient_email': {
-                'description': _('Email du signataire unique (format plat)'),
-                'example_value': 'jean.dupont@example.com',
-            },
-            'recipient_firstname': {
-                'description': _('Prénom du signataire'),
-                'example_value': 'Jean',
-            },
-            'recipient_lastname': {
-                'description': _('Nom du signataire'),
-                'example_value': 'Dupont',
-            },
-            'recipient_phone': {
-                'description': _('Téléphone du signataire pour SMS 2FA (format: +33612345678)'),
-                'example_value': '+33612345678',
-            },
-            'external_ref': {
-                'description': _('Référence externe Publik — numéro de demande'),
-                'example_value': 'DEM-2024-001',
-            },
-            'recipients': {
-                'description': _(
-                    'Liste JSON de signataires : '
-                    '[{"email": "...", "firstName": "...", "lastName": "...", '
-                    '"phoneNumber": "...", "consentPageId": "cop_xxx"}]'
-                ),
-                'example_value': '[{"email": "sig@ex.com", "firstName": "Jean", "lastName": "Dupont"}]',
-            },
-            'steps': {
-                'description': _(
-                    'Steps natifs Goodflag pour approbation + signature : '
-                    '[{"stepType": "approval|signature", "recipients": [...], "maxInvites": 5}]'
-                ),
-            },
-            'file': {
-                'description': _(
-                    'Document à signer — objet JSON : '
-                    '{"filename": "...", "content_type": "application/pdf", "content": "<base64>"}'
-                ),
-                'example_value': '{"filename": "document.pdf", "content_type": "application/pdf", "content": "<base64>"}',
-            },
-            'file_url': {
-                'description': _('URL du document PDF à télécharger depuis Publik/WCS'),
-                'example_value': '{{ form_var_document_pdf_url }}',
-            },
-            'file_base64': {
-                'description': _('Contenu du document encodé en base64'),
-            },
-            'filename': {
-                'description': _('Nom du fichier PDF (défaut: document.pdf)'),
-                'example_value': 'convention.pdf',
-            },
-            'metadata': {
-                'description': _(
-                    'Métadonnées Goodflag (champs data1 à data16 du mapping tenant). '
-                    'Requiert default_layout_id configuré sur le connecteur.'
-                ),
-                'example_value': '{"data1": "DEM-2024-001", "data2": "Service urbanisme"}',
-            },
-            'signature_profile_id': {
-                'description': _('Profil de signature Goodflag (défaut: valeur du connecteur)'),
-                'example_value': 'sip_abc123',
-            },
-            'workflow_mode': {
-                'description': _('Mode du workflow (défaut: FULL)'),
-                'example_value': 'FULL',
-            },
+            'name': {'description': _('Nom du workflow'), 'example_value': 'Signature convention 2024-001'},
+            'recipient_email': {'description': _('Email du signataire (format plat)'), 'example_value': 'jean.dupont@example.com'},
+            'recipient_firstname': {'description': _('Prénom du signataire'), 'example_value': 'Jean'},
+            'recipient_lastname': {'description': _('Nom du signataire'), 'example_value': 'Dupont'},
+            'recipient_phone': {'description': _('Téléphone 2FA'), 'example_value': '+33612345678'},
+            'external_ref': {'description': _('Référence externe Publik'), 'example_value': 'DEM-2024-001'},
+            'recipients': {'description': _('Liste JSON de signataires')},
+            'steps': {'description': _('Steps natifs Goodflag')},
+            'file': {'description': _('Document JSON : {"filename": "...", "content_type": "...", "content": "<base64>"}')},
+            'file_url': {'description': _('URL du document PDF (téléchargé par Passerelle)')},
+            'file_base64': {'description': _('Document encodé en base64')},
+            'filename': {'description': _('Nom du fichier (défaut: document.pdf)'), 'example_value': 'convention.pdf'},
+            'metadata': {'description': _('Métadonnées data1-data16')},
+            'signature_profile_id': {'description': _('Profil de signature'), 'example_value': 'sip_abc123'},
+            'workflow_mode': {'description': _('Mode du workflow (défaut: FULL)')},
         },
     )
     def submit_workflow(self, request, **kwargs):
-        """
-        Combine create-workflow + upload-document + start-workflow en un seul appel.
-        """
         payload = self._parse_payload(request, **kwargs)
 
-        # -- Étape 1 : Créer le workflow --
         name = self._get_param(payload, 'name')
         if not name:
             raise GoodflagValidationError("'name' is required")
@@ -1162,10 +825,6 @@ class GoodflagResource(BaseResource):
             },
         )
 
-        # -- Étape 2 : Upload du document --
-        # En cas d'échec ici ou à l'étape 3, la trace reste en statut 'draft'
-        # avec un workflow_id valide : l'opérateur peut diagnostiquer via
-        # l'admin Django ou relancer manuellement.
         signature_profile_id = (
             self._get_param(payload, 'signature_profile_id')
             or self.default_signature_profile_id
@@ -1201,7 +860,6 @@ class GoodflagResource(BaseResource):
                 file_size=len(file_content),
             )
 
-        # -- Étape 3 : Démarrer le workflow --
         try:
             start_result = client.start_workflow(workflow_id)
         except GoodflagError as exc:
@@ -1232,66 +890,20 @@ class GoodflagResource(BaseResource):
         name='upload-document',
         perm='can_access',
         methods=['post'],
-        description=_('Upload un document dans un workflow Goodflag existant'),
+        description=_('Upload un document dans un workflow existant'),
         long_description=_(
-            'Charge un document PDF/DOCX dans un workflow déjà créé. '
-            'Le document peut être fourni de 4 façons :\n\n'
-            '1. Objet JSON imbriqué (recommandé) :\n'
-            '{\n'
-            '  "workflow_id": "wfl_xxx",\n'
-            '  "file": {\n'
-            '    "filename": "convention.pdf",\n'
-            '    "content_type": "application/pdf",\n'
-            '    "content": "<base64>"\n'
-            '  }\n'
-            '}\n\n'
-            '2. URL Publik (le serveur Passerelle télécharge le fichier) :\n'
-            '{\n'
-            '  "workflow_id": "wfl_xxx",\n'
-            '  "file_url": "{{ form_var_document_pdf_url }}",\n'
-            '  "filename": "convention.pdf"\n'
-            '}\n\n'
-            '3. Base64 directe :\n'
-            '{"workflow_id": "wfl_xxx", "file_base64": "<base64>", "filename": "convention.pdf"}\n\n'
-            '4. Multipart Django (champ "file" dans la requête multipart)\n\n'
-            'Réponse : {"data": {"document_id": "doc_xxx", "workflow_id": "wfl_xxx", '
-            '"filename": "convention.pdf", "documents": [...], "parts": [...]}}'
+            'Accepte le fichier via JSON (file), multipart, base64 (file_base64) '
+            'ou URL (file_url téléchargée par Passerelle).'
         ),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-                'example_value': 'wfl_abc123',
-            },
-            'external_ref': {
-                'description': _('Référence externe Publik (alternative à workflow_id)'),
-                'example_value': 'DEM-2024-001',
-            },
-            'file': {
-                'description': _(
-                    'Document à signer : objet JSON {"filename": "...", '
-                    '"content_type": "application/pdf", "content": "<base64>"}'
-                ),
-                'example_value': '{"filename": "document.pdf", "content_type": "application/pdf", "content": "<base64>"}',
-            },
-            'file_url': {
-                'description': _('URL du document à télécharger (depuis Publik/WCS)'),
-                'example_value': '{{ form_var_document_pdf_url }}',
-            },
-            'file_base64': {
-                'description': _('Contenu du document encodé en base64'),
-            },
-            'filename': {
-                'description': _('Nom du fichier (défaut: document.pdf)'),
-                'example_value': 'convention.pdf',
-            },
-            'content_type': {
-                'description': _('Type MIME du fichier (défaut: application/pdf)'),
-                'example_value': 'application/pdf',
-            },
-            'signature_profile_id': {
-                'description': _('Profil de signature Goodflag (défaut: valeur du connecteur)'),
-                'example_value': 'sip_abc123',
-            },
+            'workflow_id': {'description': _('ID du workflow'), 'example_value': 'wfl_abc123'},
+            'external_ref': {'description': _('Référence externe (alternative à workflow_id)')},
+            'file': {'description': _('Document JSON : {"filename", "content_type", "content"}')},
+            'file_url': {'description': _('URL du document à télécharger')},
+            'file_base64': {'description': _('Document encodé en base64')},
+            'filename': {'description': _('Nom du fichier'), 'example_value': 'convention.pdf'},
+            'content_type': {'description': _('Type MIME (défaut: application/pdf)')},
+            'signature_profile_id': {'description': _('Profil de signature'), 'example_value': 'sip_abc123'},
         },
     )
     def upload_document(self, request, **kwargs):
@@ -1319,7 +931,6 @@ class GoodflagResource(BaseResource):
             signature_profile_id=signature_profile_id or None,
         )
 
-        # Trace du document
         doc_id = result.get('document_id')
         if doc_id:
             GoodflagDocumentTrace.objects.create(
@@ -1338,21 +949,11 @@ class GoodflagResource(BaseResource):
         name='upload-documents',
         perm='can_access',
         methods=['post'],
-        description=_('Upload plusieurs documents dans un workflow Goodflag'),
-        long_description=_(
-            'Charge plusieurs documents PDF/DOCX/Images dans un workflow '
-            'existant en une seule requête multipart.'
-        ),
+        description=_('Upload plusieurs documents dans un workflow'),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-            },
-            'external_ref': {
-                'description': _('Référence externe (ID Publik/WCS)'),
-            },
-            'files': {
-                'description': _('Données des fichiers (JSON)'),
-            },
+            'workflow_id': {'description': _('ID du workflow')},
+            'external_ref': {'description': _('Référence externe Publik')},
+            'files': {'description': _('Liste des fichiers (JSON)')},
         },
     )
     def upload_documents(self, request, **kwargs):
@@ -1399,7 +1000,6 @@ class GoodflagResource(BaseResource):
             files_list=files_list,
         )
 
-        # Traces des documents
         for doc in result.get('documents', []):
             GoodflagDocumentTrace.objects.create(
                 resource=self,
@@ -1416,19 +1016,9 @@ class GoodflagResource(BaseResource):
         perm='can_access',
         methods=['post'],
         description=_('Démarre un workflow Goodflag'),
-        long_description=_(
-            'Passe le statut du workflow à "started" via PATCH. '
-            'Les destinataires de la première étape recevront leurs '
-            'invitations par email.'
-        ),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-                'example_value': 'wfl_abc123',
-            },
-            'external_ref': {
-                'description': _('Référence externe (ID Publik/WCS)'),
-            },
+            'workflow_id': {'description': _('ID du workflow'), 'example_value': 'wfl_abc123'},
+            'external_ref': {'description': _('Référence externe Publik')},
         },
     )
     def start_workflow(self, request, **kwargs):
@@ -1443,7 +1033,6 @@ class GoodflagResource(BaseResource):
         client = self._get_client()
         result = client.start_workflow(workflow_id)
 
-        # Mise à jour de la trace
         GoodflagWorkflowTrace.objects.filter(
             resource=self,
             goodflag_workflow_id=workflow_id,
@@ -1452,8 +1041,6 @@ class GoodflagResource(BaseResource):
             updated_at=timezone.now(),
         )
 
-        # Ne retourner que les champs essentiels (sans 'raw') pour éviter
-        # que WCS ait à analyser une réponse volumineuse.
         return {'data': {
             'workflow_id': result.get('workflow_id', workflow_id),
             'status': result.get('status', 'started'),
@@ -1463,15 +1050,10 @@ class GoodflagResource(BaseResource):
         name='get-workflow',
         perm='can_access',
         methods=['get'],
-        description=_('Récupère le détail d\'un workflow Goodflag'),
+        description=_('Récupère le détail d\'un workflow'),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-                'example_value': 'wfl_abc123',
-            },
-            'external_ref': {
-                'description': _('Référence externe (ID Publik/WCS)'),
-            },
+            'workflow_id': {'description': _('ID du workflow'), 'example_value': 'wfl_abc123'},
+            'external_ref': {'description': _('Référence externe Publik')},
         },
     )
     def get_workflow(self, request, workflow_id=None, external_ref=None):
@@ -1485,7 +1067,6 @@ class GoodflagResource(BaseResource):
         client = self._get_client()
         result = client.get_workflow(workflow_id)
 
-        # Mise à jour de la trace locale
         GoodflagWorkflowTrace.objects.filter(
             resource=self,
             goodflag_workflow_id=workflow_id,
@@ -1501,18 +1082,9 @@ class GoodflagResource(BaseResource):
         perm='can_access',
         methods=['post'],
         description=_('Arrête un workflow Goodflag'),
-        long_description=_(
-            'Passe le statut du workflow à "stopped". '
-            'Les invitations en cours seront invalidées.'
-        ),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-                'example_value': 'wfl_abc123',
-            },
-            'external_ref': {
-                'description': _('Référence externe (ID Publik/WCS)'),
-            },
+            'workflow_id': {'description': _('ID du workflow'), 'example_value': 'wfl_abc123'},
+            'external_ref': {'description': _('Référence externe Publik')},
         },
     )
     def stop_workflow(self, request, workflow_id=None, external_ref=None):
@@ -1528,7 +1100,6 @@ class GoodflagResource(BaseResource):
         client = self._get_client()
         result = client.stop_workflow(workflow_id)
 
-        # Mise à jour de la trace
         GoodflagWorkflowTrace.objects.filter(
             resource=self,
             goodflag_workflow_id=workflow_id,
@@ -1545,13 +1116,8 @@ class GoodflagResource(BaseResource):
         methods=['post'],
         description=_('Archive un workflow Goodflag'),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-                'example_value': 'wfl_abc123',
-            },
-            'external_ref': {
-                'description': _('Référence externe (ID Publik/WCS)'),
-            },
+            'workflow_id': {'description': _('ID du workflow'), 'example_value': 'wfl_abc123'},
+            'external_ref': {'description': _('Référence externe Publik')},
         },
     )
     def archive_workflow(self, request, workflow_id=None, external_ref=None):
@@ -1567,7 +1133,6 @@ class GoodflagResource(BaseResource):
         client = self._get_client()
         result = client.archive_workflow(workflow_id)
 
-        # Mise à jour de la trace
         GoodflagWorkflowTrace.objects.filter(
             resource=self,
             goodflag_workflow_id=workflow_id,
@@ -1582,44 +1147,17 @@ class GoodflagResource(BaseResource):
         name='sync-status',
         perm='can_access',
         methods=['get'],
-        description=_(
-            'Récupère et normalise le statut d\'un workflow Goodflag '
-            'en états simples exploitables par W.C.S.'
-        ),
+        description=_('Statut normalisé d\'un workflow (draft/started/finished/refused/error)'),
         long_description=_(
-            'Interroge l\'API Goodflag et retourne un statut normalisé parmi :\n'
-            '  draft     — workflow créé, pas encore démarré\n'
-            '  started   — workflow en cours (invitations envoyées)\n'
-            '  finished  — workflow terminé, document signé disponible\n'
-            '  refused   — workflow arrêté ou refusé par un signataire\n'
-            '  error     — statut inconnu ou erreur API\n\n'
-            'Utilisation recommandée dans W.C.S. (pattern backoffice) :\n'
-            '  URL : ?workflow_id={{ form_var_goodflag_workflow_id }}\n'
-            '  varname : goodflag_status\n'
-            '  Stocker dans champ backoffice :\n'
-            '    goodflag_status_response_data_status → bo-goodflag-status\n'
-            '  Condition de saut : form_var_goodflag_status == "finished"\n\n'
-            'Le résultat est mis en cache (status_cache_ttl secondes) pour éviter '
-            'des appels API répétitifs lors du polling. Les statuts finaux ne sont pas cachés.\n\n'
-            'Réponse : {"data": {"workflow_id": "wfl_xxx", "raw_status": "finished", '
-            '"status": "finished", "progress": 100, "is_final": true}}'
+            'Retourne un statut simplifié pour WCS. '
+            'Résultat mis en cache (status_cache_ttl secondes, sauf statuts finaux).'
         ),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-                'example_value': 'wfl_abc123',
-            },
-            'external_ref': {
-                'description': _('Référence externe Publik (alternative à workflow_id)'),
-                'example_value': 'DEM-2024-001',
-            },
+            'workflow_id': {'description': _('ID du workflow'), 'example_value': 'wfl_abc123'},
+            'external_ref': {'description': _('Référence externe Publik')},
         },
     )
     def sync_status(self, request, workflow_id=None, external_ref=None):
-        """
-        Endpoint utilitaire pour W.C.S. : retourne un statut normalisé
-        parmi draft, started, pending, finished, refused, cancelled, error.
-        """
         if not workflow_id:
             workflow_id = self._resolve_workflow_id(request.GET)
         if not workflow_id:
@@ -1627,7 +1165,6 @@ class GoodflagResource(BaseResource):
                 "'workflow_id' or 'external_ref' is required"
             )
 
-        # Cache statut pour éviter des appels API répétitifs
         cache_key = f'goodflag_status_{self.pk}_{workflow_id}'
         cached = None
         if self.status_cache_ttl > 0:
@@ -1651,7 +1188,6 @@ class GoodflagResource(BaseResource):
             workflow_id, raw_status, normalized,
         )
 
-        # Mise à jour trace
         GoodflagWorkflowTrace.objects.filter(
             resource=self,
             goodflag_workflow_id=workflow_id,
@@ -1660,7 +1196,6 @@ class GoodflagResource(BaseResource):
             updated_at=timezone.now(),
         )
 
-        # Mise en cache du résultat
         is_final = normalized in _FINAL_STATUSES
         response_data = {
             'workflow_id': workflow_id,
@@ -1679,24 +1214,11 @@ class GoodflagResource(BaseResource):
         perm='can_access',
         methods=['post'],
         description=_('Crée une invitation pour un destinataire'),
-        long_description=_(
-            'Génère une URL d\'invitation pour un signataire ou '
-            'approbateur d\'un workflow en cours. Utile pour envoyer '
-            'les invitations depuis Publik plutôt que par Goodflag.'
-        ),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-            },
-            'external_ref': {
-                'description': _('Référence externe (ID Publik/WCS)'),
-            },
-            'recipient_email': {
-                'description': _('Email du destinataire'),
-            },
-            'recipient_phone': {
-                'description': _('Téléphone du destinataire (pour SMS 2FA)'),
-            },
+            'workflow_id': {'description': _('ID du workflow')},
+            'external_ref': {'description': _('Référence externe Publik')},
+            'recipient_email': {'description': _('Email du destinataire')},
+            'recipient_phone': {'description': _('Téléphone 2FA')},
         },
     )
     def create_invite(self, request, **kwargs):
@@ -1727,20 +1249,10 @@ class GoodflagResource(BaseResource):
         name='download-signed-documents',
         perm='can_access',
         methods=['get'],
-        description=_('Télécharge les documents signés d\'un workflow terminé'),
-        long_description=_(
-            'Télécharge les documents signés via GET /downloadDocuments. '
-            'Retourne un PDF unique ou un ZIP si plusieurs documents. '
-            'Le contenu est retourné directement en réponse HTTP binaire.'
-        ),
+        description=_('Télécharge les documents signés'),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-                'example_value': 'wfl_abc123',
-            },
-            'external_ref': {
-                'description': _('Référence externe (ID Publik/WCS)'),
-            },
+            'workflow_id': {'description': _('ID du workflow'), 'example_value': 'wfl_abc123'},
+            'external_ref': {'description': _('Référence externe Publik')},
         },
     )
     def download_signed_documents(self, request, workflow_id=None, external_ref=None):
@@ -1751,10 +1263,6 @@ class GoodflagResource(BaseResource):
                 "'workflow_id' or 'external_ref' is required"
             )
 
-        # Pas de pré-vérification du statut ici : c'est la condition de saut
-        # WCS (<type>django</type>) qui contrôle la transition.
-        # Si Goodflag refuse le download (workflow pas terminé),
-        # l'API renverra une erreur HTTP que l'on propage.
         client = self._get_client()
         try:
             result = client.download_documents(workflow_id, streaming=True)
@@ -1788,21 +1296,10 @@ class GoodflagResource(BaseResource):
         name='get-viewer-url',
         perm='can_access',
         methods=['post', 'get'],
-        description=_(
-            'Génère une URL de viewer pour un document Goodflag'
-        ),
-        long_description=_(
-            'Permet d\'ouvrir le document dans le navigateur pour '
-            'visualisation ou placement des champs de signature.'
-        ),
+        description=_('Génère une URL de viewer pour un document'),
         parameters={
-            'document_id': {
-                'description': _('Identifiant du document Goodflag'),
-                'example_value': 'doc_abc123',
-            },
-            'redirect_url': {
-                'description': _('URL de redirection après fermeture du viewer'),
-            },
+            'document_id': {'description': _('ID du document'), 'example_value': 'doc_abc123'},
+            'redirect_url': {'description': _('URL de redirection après fermeture')},
         },
     )
     def get_viewer_url(self, request, document_id=None, redirect_url=None, expired=None):
@@ -1822,17 +1319,10 @@ class GoodflagResource(BaseResource):
         name='download-evidence',
         perm='can_access',
         methods=['get'],
-        description=_(
-            'Télécharge le certificat de preuve d\'un workflow terminé'
-        ),
+        description=_('Télécharge le certificat de preuve'),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-                'example_value': 'wfl_abc123',
-            },
-            'external_ref': {
-                'description': _('Référence externe (ID Publik/WCS)'),
-            },
+            'workflow_id': {'description': _('ID du workflow'), 'example_value': 'wfl_abc123'},
+            'external_ref': {'description': _('Référence externe Publik')},
         },
     )
     def download_evidence(self, request, workflow_id=None, external_ref=None):
@@ -1847,7 +1337,6 @@ class GoodflagResource(BaseResource):
         result = client.download_evidence_certificate(workflow_id, streaming=True)
 
         if 'response' in result:
-            # Mode streaming
             streaming_response = StreamingHttpResponse(
                 result['response'].iter_content(chunk_size=8192),
                 content_type=result['content_type'],
@@ -1870,26 +1359,9 @@ class GoodflagResource(BaseResource):
         name='webhook',
         perm='open',
         methods=['post'],
-        description=_('Reçoit les notifications webhook de Goodflag'),
-        long_description=_(
-            'Endpoint public pour recevoir les événements webhook '
-            'Goodflag. Sécurisé par re-validation via l\'API '
-            'webhookEvents de Goodflag (Goodflag ne signe pas ses '
-            'webhooks par HMAC). Idempotent par event_id.'
-        ),
+        description=_('Reçoit les notifications webhook Goodflag'),
     )
     def webhook(self, request):
-        """
-        Endpoint webhook pour recevoir les notifications Goodflag.
-
-        Sécurité :
-        - Goodflag ne signe pas ses webhooks (pas de HMAC).
-        - On valide par token dans l'URL (webhook_secret) et/ou
-          par re-validation via l'API webhookEvents.
-        - Idempotence par event_id unique.
-        - Journalisation complète.
-        """
-        # Validation par token URL si configuré
         if self.webhook_secret:
             provided_token = request.GET.get('token', '')
             if not hmac.compare_digest(provided_token, self.webhook_secret):
@@ -1905,13 +1377,10 @@ class GoodflagResource(BaseResource):
             logger.warning("Webhook received with invalid JSON body")
             return JsonResponse({'error': 'Invalid JSON'}, status=400)
 
-        # Structure du webhook event Goodflag
         event_id = payload.get('id', '')
         event_type = payload.get('eventType', '')
         workflow_id = payload.get('workflowId', '')
 
-        # Rejeter les webhooks sans event_id : sans lui, impossible d'assurer
-        # l'idempotence (anti-rejeu) ni la re-validation via l'API Goodflag.
         if not event_id:
             logger.warning("Webhook received without event_id, rejecting")
             return JsonResponse({'error': 'Missing event id'}, status=400)
@@ -1924,27 +1393,22 @@ class GoodflagResource(BaseResource):
             event_id, event_type, workflow_id
         )
 
-        # Anti-rejeu : vérifier si cet événement a déjà été traité
-        if event_id:
-            already_exists = GoodflagWebhookEvent.objects.filter(
-                resource=self,
-                event_id=event_id,
-            ).exists()
-            if already_exists:
+        already_exists = GoodflagWebhookEvent.objects.filter(
+            resource=self,
+            event_id=event_id,
+        ).exists()
+        if already_exists:
                 logger.info(
                     "Webhook event already processed, skipping: event_id=%s",
                     event_id
                 )
                 return JsonResponse({'status': 'already_processed'})
 
-        # Re-validation via l'API Goodflag : vérifier que l'événement
-        # existe réellement dans Goodflag
         raw_status = ''
         normalized_status = ''
-        if event_id and workflow_id:
+        if workflow_id:
             try:
                 client = self._get_client()
-                # Vérifier l'événement via l'API webhookEvents
                 verified_event = client.get_webhook_event(event_id)
                 if verified_event.get('workflowId') != workflow_id:
                     logger.warning(
@@ -1956,19 +1420,14 @@ class GoodflagResource(BaseResource):
                         {'error': 'Event verification failed'}, status=403
                     )
 
-                # Récupérer le statut actuel du workflow
                 wf_data = client.get_workflow(workflow_id)
                 raw_status = wf_data.get('status', '')
                 normalized_status = wf_data.get('normalized_status', '')
             except GoodflagError as exc:
-                logger.warning(
-                    "Failed to re-validate webhook via API: %s", exc
-                )
-                # On accepte quand même l'événement mais on le note
+                logger.warning("Webhook re-validation failed: %s", exc)
                 raw_status = 'unverified'
                 normalized_status = 'error'
 
-        # Enregistrement de l'événement
         GoodflagWebhookEvent.objects.create(
             resource=self,
             event_id=event_id,
@@ -1982,7 +1441,6 @@ class GoodflagResource(BaseResource):
             timestamp_goodflag=str(created),
         )
 
-        # Mise à jour de la trace workflow
         if workflow_id and normalized_status:
             GoodflagWorkflowTrace.objects.filter(
                 resource=self,
@@ -1992,7 +1450,6 @@ class GoodflagResource(BaseResource):
                 updated_at=timezone.now(),
             )
 
-        # Notification WCS si événement significatif
         if event_type in self._NOTIFY_EVENT_TYPES:
             self._notify_wcs(workflow_id, event_type, normalized_status, event_id)
 
@@ -2002,17 +1459,9 @@ class GoodflagResource(BaseResource):
         name='retrieve-by-external-ref',
         perm='can_access',
         methods=['get'],
-        description=_(
-            'Retrouve un workflow Goodflag à partir d\'une référence '
-            'externe Publik'
-        ),
+        description=_('Retrouve un workflow par référence externe Publik'),
         parameters={
-            'external_ref': {
-                'description': _(
-                    'Référence externe (ex: numéro de demande Publik)'
-                ),
-                'example_value': 'DEMANDE-2024-001',
-            },
+            'external_ref': {'description': _('Référence externe'), 'example_value': 'DEM-2024-001'},
         },
     )
     def retrieve_by_external_ref(self, request, external_ref):
@@ -2046,23 +1495,11 @@ class GoodflagResource(BaseResource):
         name='resend-invite',
         perm='can_access',
         methods=['post'],
-        description=_('Renvoie une invitation par email à un destinataire'),
-        long_description=_(
-            'Envoie ou ré-envoie une invitation email à un signataire. '
-            'Utile pour relancer un signataire qui n\'a pas reçu ou lu '
-            'son invitation initiale depuis W.C.S.'
-        ),
+        description=_('Renvoie une invitation par email'),
         parameters={
-            'workflow_id': {
-                'description': _('Identifiant du workflow Goodflag'),
-                'example_value': 'wfl_abc123',
-            },
-            'external_ref': {
-                'description': _('Référence externe (ID Publik/WCS)'),
-            },
-            'recipient_email': {
-                'description': _('Email du destinataire à qui renvoyer l\'invitation'),
-            },
+            'workflow_id': {'description': _('ID du workflow'), 'example_value': 'wfl_abc123'},
+            'external_ref': {'description': _('Référence externe Publik')},
+            'recipient_email': {'description': _('Email du destinataire')},
         },
     )
     def resend_invite(self, request, **kwargs):
@@ -2087,25 +1524,12 @@ class GoodflagResource(BaseResource):
         name='list-workflows',
         perm='can_access',
         methods=['get'],
-        description=_('Liste et recherche les workflows Goodflag'),
-        long_description=_(
-            'Recherche dans les workflows Goodflag avec filtres optionnels. '
-            'Utile pour diagnostiquer les workflows bloqués ou pour la '
-            'supervision depuis W.C.S.'
-        ),
+        description=_('Liste et recherche les workflows'),
         parameters={
-            'text': {
-                'description': _('Texte de recherche (nom du workflow)'),
-            },
-            'status': {
-                'description': _('Filtre par statut (draft, started, finished, stopped)'),
-            },
-            'page': {
-                'description': _('Index de page (0-based, défaut 0)'),
-            },
-            'per_page': {
-                'description': _('Éléments par page (défaut 50, max 100)'),
-            },
+            'text': {'description': _('Texte de recherche')},
+            'status': {'description': _('Filtre par statut')},
+            'page': {'description': _('Index de page (défaut 0)')},
+            'per_page': {'description': _('Éléments par page (défaut 50, max 100)')},
         },
     )
     def list_workflows(self, request, **kwargs):
@@ -2121,7 +1545,6 @@ class GoodflagResource(BaseResource):
         except (TypeError, ValueError):
             items_per_page = 50
 
-        # Mapping statut normalisé Publik → statut brut Goodflag
         _REVERSE_STATUS_MAP = {
             'refused': 'stopped',
             'finished': 'finished',
@@ -2163,21 +1586,8 @@ class GoodflagResource(BaseResource):
         }
 
 
-# ====================================================================== #
-# Modèles de persistance locale
-# ====================================================================== #
-
-
 class GoodflagWorkflowTrace(models.Model):
-    """
-    Corrélation entre un workflow Goodflag et une demande Publik.
-
-    Permet de :
-    - retrouver un workflow par sa référence externe Publik
-    - suivre le statut courant sans appeler l'API Goodflag
-    - prévenir les créations de doublons
-    - fournir un historique minimal
-    """
+    """Corrélation workflow Goodflag <-> demande Publik."""
 
     resource = models.ForeignKey(
         GoodflagResource,
@@ -2250,14 +1660,7 @@ class GoodflagWorkflowTrace(models.Model):
 
 
 class GoodflagWebhookEvent(models.Model):
-    """
-    Journal des événements webhook reçus de Goodflag.
-
-    Permet de :
-    - assurer l'idempotence (anti-rejeu)
-    - tracer l'historique des notifications
-    - diagnostiquer les problèmes d'intégration
-    """
+    """Journal des événements webhook reçus de Goodflag."""
 
     resource = models.ForeignKey(
         GoodflagResource,
@@ -2364,14 +1767,7 @@ class GoodflagWebhookEvent(models.Model):
 
 
 class GoodflagDocumentTrace(models.Model):
-    """
-    Métadonnées des documents uploadés ou signés dans Goodflag.
-
-    Permet de :
-    - retrouver les documents associés à un workflow
-    - tracer les uploads
-    - conserver les métadonnées sans stocker le contenu binaire
-    """
+    """Métadonnées des documents uploadés ou signés."""
 
     resource = models.ForeignKey(
         GoodflagResource,

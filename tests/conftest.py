@@ -1,7 +1,3 @@
-"""
-Fixtures pytest pour les tests du connecteur Goodflag.
-"""
-
 import pytest
 
 from passerelle_goodflag.models import GoodflagResource
@@ -9,7 +5,6 @@ from passerelle_goodflag.models import GoodflagResource
 
 @pytest.fixture
 def connector(db):
-    """Crée une instance de connecteur Goodflag pour les tests."""
     return GoodflagResource.objects.create(
         title='Test Goodflag',
         slug='test-goodflag',
@@ -29,7 +24,6 @@ def connector(db):
     )
 
 
-# Réponse de création de workflow (POST /api/users/{userId}/workflows)
 MOCK_WORKFLOW_RESPONSE = {
     'id': 'wfl_Test001',
     'workflowStatus': 'draft',
@@ -59,7 +53,6 @@ MOCK_WORKFLOW_RESPONSE = {
     'tenantId': 'ten_TestTenant',
 }
 
-# Réponse de détail workflow (GET /api/workflows/{id})
 MOCK_WORKFLOW_DETAIL = {
     'id': 'wfl_Test001',
     'workflowStatus': 'started',
@@ -100,7 +93,6 @@ MOCK_WORKFLOW_DETAIL = {
     'tenantId': 'ten_TestTenant',
 }
 
-# Réponse d'upload document (POST /api/workflows/{id}/parts)
 MOCK_UPLOAD_RESPONSE = {
     'documents': [
         {
@@ -131,7 +123,6 @@ MOCK_UPLOAD_RESPONSE = {
     'ignoredAttachments': 0,
 }
 
-# Réponse de démarrage workflow (PATCH /api/workflows/{id})
 MOCK_START_RESPONSE = {
     'id': 'wfl_Test001',
     'workflowStatus': 'started',
@@ -142,10 +133,8 @@ MOCK_START_RESPONSE = {
     'updated': 1700000100000,
 }
 
-# Réponse de version (GET /api/version)
 MOCK_VERSION_RESPONSE = 'sgs-wm-webapp:1.19.4-RC1'
 
-# Réponse de recherche workflows (GET /api/workflows)
 MOCK_WORKFLOW_LIST = {
     'items': [MOCK_WORKFLOW_RESPONSE],
     'itemsPerPage': 50,
@@ -153,12 +142,10 @@ MOCK_WORKFLOW_LIST = {
     'totalItems': 1,
 }
 
-# Réponse de création d'invitation (POST /api/workflows/{id}/invite)
 MOCK_INVITE_RESPONSE = {
     'inviteUrl': 'https://goodflag.test/invite?token=eyJtest123',
 }
 
-# Réponse de webhookEvent (GET /api/webhookEvents/{id})
 MOCK_WEBHOOK_EVENT = {
     'id': 'wbe_Event001',
     'tenantId': 'ten_TestTenant',

@@ -1,11 +1,5 @@
-"""
-Tests unitaires du client HTTP Goodflag.
-
-Vérifie que le client appelle les bons endpoints de l'API Goodflag
-(v1.19.4) avec les bons paramètres et gère correctement les erreurs.
-"""
-
 import base64
+import json
 
 import pytest
 import responses
@@ -15,6 +9,7 @@ from passerelle_goodflag.exceptions import (
     GoodflagAuthError,
     GoodflagError,
     GoodflagNotFoundError,
+    GoodflagRateLimitError,
     GoodflagTimeoutError,
     GoodflagValidationError,
 )
@@ -137,8 +132,6 @@ class TestCreateWorkflow:
         assert result['workflow_id'] == 'wfl_001'
         assert result['status'] == 'draft'
 
-        # Vérification du payload envoyé
-        import json
         sent = responses.calls[0].request
         body = json.loads(sent.body)
         assert body['name'] == 'Test WF'
@@ -214,12 +207,10 @@ class TestUploadDocument:
         assert result['document_id'] == 'doc_001'
         assert result['workflow_id'] == 'wfl_001'
 
-        # Vérification des query params
         sent = responses.calls[0].request
         assert 'createDocuments=true' in sent.url
         assert 'signatureProfileId=sip_Profile' in sent.url
 
-        # Vérification que le fichier est envoyé en binaire brut (pas multipart)
         assert sent.headers.get('Content-Type') == 'application/pdf'
         assert 'filename="test.pdf"' in sent.headers.get('Content-Disposition', '')
         assert b'%PDF-1.4' in sent.body
@@ -279,8 +270,6 @@ class TestStartWorkflow:
         result = client.start_workflow('wfl_001')
         assert result['status'] == 'started'
 
-        # Vérification du payload : doit envoyer workflowStatus: started
-        import json
         sent = responses.calls[0].request
         body = json.loads(sent.body)
         assert body['workflowStatus'] == 'started'
@@ -347,7 +336,6 @@ class TestCreateInvite:
         assert result['invite_url'].startswith('https://')
         assert result['recipient_email'] == 'signer@example.com'
 
-        import json
         sent = responses.calls[0].request
         body = json.loads(sent.body)
         assert body['recipientEmail'] == 'signer@example.com'
@@ -475,7 +463,6 @@ class TestSendInviteClient:
         assert result['invite_url'] == 'https://sign.example.com/invite/xyz'
         assert result['workflow_id'] == 'wfl_Test001'
         assert result['recipient_email'] == 'signer@example.com'
-        # Vérifier que 'raw' n'est plus dans le retour
         assert 'raw' not in result
 
 
@@ -533,7 +520,6 @@ class TestSearchWorkflowsClient:
 class TestRateLimitClient:
     @responses.activate
     def test_429_raises_rate_limit_error(self, client):
-        from passerelle_goodflag.exceptions import GoodflagRateLimitError
         responses.add(
             responses.GET,
             f'{BASE_URL}/workflows/wfl_Test001',

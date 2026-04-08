@@ -1,28 +1,15 @@
 """
-Client HTTP dédié pour l'API Goodflag Workflow Manager.
+Client HTTP pour l'API Goodflag Workflow Manager (v1.19.4).
 
-Centralise tous les appels HTTP vers l'API Goodflag, gère l'authentification
-Bearer, les erreurs, les timeouts, et expose des méthodes métier claires.
-
-Points d'intégration API Goodflag (v1.19.4) :
-- Authentification par header Authorization: Bearer <token>
-- API REST JSON, base URL de type https://<host>/api
-- Endpoints principaux :
-    GET    /api/version                           -> test de connectivité
-    POST   /api/users/{userId}/workflows          -> créer un workflow
-    GET    /api/workflows/{id}                    -> détail d'un workflow
-    PATCH  /api/workflows/{id}                    -> mettre à jour / démarrer
-    POST   /api/workflows/{id}/parts              -> upload document (multipart)
-    GET    /api/workflows/{id}/downloadDocuments   -> télécharger docs signés
-    GET    /api/workflows/{id}/downloadEvidences   -> télécharger preuves
-    GET    /api/webhookEvents/{id}                 -> vérifier un événement webhook
-    POST   /api/workflows/{id}/invite              -> créer une invitation
-    POST   /api/workflows/{id}/sendInvite          -> envoyer une invitation
+Centralise les appels HTTP, l'authentification Bearer, les retries
+et le mapping d'erreurs vers les exceptions métier.
 """
 
 import base64
 import io
 import logging
+import re
+from urllib.parse import unquote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -40,20 +27,17 @@ from .exceptions import (
 
 logger = logging.getLogger(__name__)
 
-# Taille max d'upload : 50 Mo
-MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 Mo
 
 ALLOWED_CONTENT_TYPES = (
     'application/pdf',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # DOCX
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     'image/jpeg',
     'image/png',
     'image/webp',
 )
 
-# Mapping des statuts Goodflag (champ workflowStatus) vers des statuts
-# normalisés Publik. Les valeurs réelles de l'API sont :
-# draft, started, stopped, finished
+# Mapping statuts Goodflag -> statuts normalisés Publik
 STATUS_MAP = {
     'draft': 'draft',
     'started': 'started',
@@ -62,27 +46,18 @@ STATUS_MAP = {
     'archived': 'archived',
 }
 
-# Nombre maximum de champs de métadonnées Goodflag
 MAX_METADATA_SLOTS = 16
 
 
 def _parse_content_disposition_filename(header, default):
-    """
-    Extrait le nom de fichier depuis un header Content-Disposition (RFC 6266).
-
-    Gère :
-    - filename="foo.pdf"          (RFC 2183 basique)
-    - filename*=UTF-8''foo%20bar  (RFC 5987 — priorité si présent)
-    """
-    import re
-    from urllib.parse import unquote
+    """Extrait le nom de fichier depuis un header Content-Disposition (RFC 6266)."""
     if not header:
         return default
-    # RFC 5987 : filename*=charset''encoded_value
+    # RFC 5987 : filename*=charset''encoded_value (prioritaire)
     m = re.search(r"filename\*\s*=\s*[^']*''([^\s;]+)", header, re.IGNORECASE)
     if m:
         return unquote(m.group(1)) or default
-    # RFC 2183 : filename="value" ou filename=value
+    # RFC 2183 : filename="value"
     m = re.search(r'filename\s*=\s*"([^"]*)"', header, re.IGNORECASE)
     if m:
         return m.group(1) or default
@@ -112,7 +87,7 @@ def _sanitize_for_log(data):
 
 
 class GoodflagClient:
-    """Client HTTP pour l'API Goodflag Workflow Manager."""
+    """Client HTTP pour l'API Goodflag."""
 
     def __init__(self, base_url, access_token, timeout=30, verify_ssl=True):
         if not base_url:
@@ -131,10 +106,8 @@ class GoodflagClient:
         })
         self.session.verify = self.verify_ssl
 
-        # Stratégie de retry automatique
-        # Retry uniquement sur les méthodes idempotentes (GET, HEAD, OPTIONS).
-        # POST/PATCH sont exclus : un retry automatique pourrait créer des doublons
-        # (ex: plusieurs workflows identiques ou plusieurs démarrages).
+        # Retry uniquement sur les méthodes idempotentes pour éviter
+        # les doublons (création de workflow, démarrage, etc.)
         retry_strategy = Retry(
             total=3,
             backoff_factor=1,
@@ -146,27 +119,11 @@ class GoodflagClient:
         self.session.mount("http://", adapter)
 
     def _url(self, path):
-        """Construit l'URL complète à partir d'un chemin relatif."""
         return f'{self.base_url}/{path.lstrip("/")}'
 
     def _request(self, method, path, json_data=None, params=None, files=None,
                  data=None, headers=None, raw_response=False):
-        """
-        Effectue une requête HTTP et gère les erreurs de manière centralisée.
-
-        Args:
-            method: GET, POST, PUT, DELETE, PATCH
-            path: chemin relatif (ex: /workflows)
-            json_data: corps JSON
-            params: query params
-            files: fichiers pour upload multipart
-            data: corps binaire brut
-            headers: headers additionnels
-            raw_response: si True, retourne l'objet Response brut
-
-        Returns:
-            dict ou Response selon raw_response
-        """
+        """Effectue une requête HTTP avec gestion centralisée des erreurs."""
         url = self._url(path)
 
         logger.debug(
@@ -209,7 +166,6 @@ class GoodflagClient:
         if response.status_code == 204:
             return {}
 
-        # L'endpoint /api/version retourne une chaîne JSON simple
         content_type = response.headers.get('Content-Type', '')
         if 'application/json' not in content_type:
             return {'raw_text': response.text}
@@ -222,7 +178,6 @@ class GoodflagClient:
                 status_code=response.status_code,
             )
 
-        # La réponse peut être une string (ex: version)
         if isinstance(data, str):
             return {'version': data}
 
@@ -247,59 +202,33 @@ class GoodflagClient:
             response.status_code, error_msg, error_code
         )
 
-        if response.status_code == 401:
-            raise GoodflagAuthError(
-                f"Authentication failed: {error_msg} (URL: {response.url})",
-                status_code=401,
-                response_data=error_data,
-            )
-        elif response.status_code == 403:
-            raise GoodflagAuthError(
-                f"Forbidden: {error_msg} (URL: {response.url})",
-                status_code=403,
-                response_data=error_data,
-            )
-        elif response.status_code == 404:
-            raise GoodflagNotFoundError(
-                f"Not found: {error_msg} (URL: {response.url})",
-                status_code=404,
-                response_data=error_data,
-            )
-        elif response.status_code in (400, 422):
-            raise GoodflagValidationError(
-                f"Validation error: {error_msg} (URL: {response.url})",
-                status_code=response.status_code,
-                response_data=error_data,
-            )
-        elif response.status_code == 429:
-            retry_after = None
+        status = response.status_code
+        url = response.url
+        kwargs = dict(status_code=status, response_data=error_data)
+
+        if status == 401:
+            raise GoodflagAuthError(f"Authentication failed: {error_msg} (URL: {url})", **kwargs)
+        if status == 403:
+            raise GoodflagAuthError(f"Forbidden: {error_msg} (URL: {url})", **kwargs)
+        if status == 404:
+            raise GoodflagNotFoundError(f"Not found: {error_msg} (URL: {url})", **kwargs)
+        if status in (400, 422):
+            raise GoodflagValidationError(f"Validation error: {error_msg} (URL: {url})", **kwargs)
+        if status == 429:
             try:
                 retry_after = int(response.headers.get('Retry-After', 60))
             except (TypeError, ValueError):
                 retry_after = 60
             raise GoodflagRateLimitError(
-                f"Rate limit exceeded, retry after {retry_after}s (URL: {response.url})",
-                status_code=429,
-                retry_after=retry_after,
-                response_data=error_data,
+                f"Rate limit exceeded, retry after {retry_after}s (URL: {url})",
+                retry_after=retry_after, **kwargs,
             )
-        else:
-            raise GoodflagError(
-                f"API error (HTTP {response.status_code}): {error_msg} (URL: {response.url})",
-                status_code=response.status_code,
-                response_data=error_data,
-            )
+        raise GoodflagError(f"API error (HTTP {status}): {error_msg} (URL: {url})", **kwargs)
 
-    # ------------------------------------------------------------------ #
-    # Méthodes métier
-    # ------------------------------------------------------------------ #
+    # -- Méthodes métier ---------------------------------------------------
 
     def test_connection(self):
-        """
-        Teste la connexion à l'API Goodflag via GET /api/version.
-
-        Retourne la version de l'application si la connexion est OK.
-        """
+        """Teste la connexion via GET /api/version."""
         try:
             data = self._request('GET', '/version')
             version = data.get('version', str(data))
@@ -328,59 +257,18 @@ class GoodflagClient:
                         allowed_comanager_users=None,
                         comanager_notified_events=None):
         """
-        Crée un workflow Goodflag.
+        Crée un workflow via POST /api/users/{userId}/workflows.
 
-        L'API Goodflag attend :
-        POST /api/users/{userId}/workflows
-        {
-            "name": "...",
-            "description": "...",
-            "workflowMode": "FULL" | "SINGLE_SIGNER",
-            "steps": [
-                {
-                    "stepType": "signature" | "approval",
-                    "recipients": [
-                        {
-                            "consentPageId": "cop_...",
-                            "email": "...",
-                            "firstName": "...",
-                            "lastName": "...",
-                            ...
-                        }
-                    ],
-                    "maxInvites": 5,
-                    ...
-                }
-            ],
-            "layoutId": "...",
-            "data1": "...", "data2": "...", ...
-        }
-
-        Args:
-            user_id: identifiant de l'utilisateur propriétaire du workflow
-            name: nom du workflow
-            steps: liste des étapes (chaque étape contient stepType et recipients)
-            description: description optionnelle
-            workflow_mode: FULL ou SINGLE_SIGNER (défaut: FULL)
-            notified_events: types d'événements notifiés au propriétaire
-            watchers: observateurs du workflow
-            template_id: identifiant du template
-            allow_consolidation: activer la consolidation
-            layout_id: identifiant du layout (requis pour les métadonnées)
-            metadata: dict avec clés data1-data16 pour les métadonnées
-            external_ref: référence externe (stockée dans data1 si pas de
-                         mapping explicite, et aussi en local)
+        Le workflow est créé en statut draft. Il faudra ensuite uploader
+        un document puis le démarrer (ou utiliser submit-workflow).
         """
         payload = {
             'name': name,
             'steps': steps,
+            'workflowMode': workflow_mode or 'FULL',
         }
         if description:
             payload['description'] = description
-        if workflow_mode:
-            payload['workflowMode'] = workflow_mode
-        else:
-            payload['workflowMode'] = 'FULL'
         if notified_events:
             payload['notifiedEvents'] = notified_events
         if watchers:
@@ -396,7 +284,7 @@ class GoodflagClient:
         if comanager_notified_events:
             payload['coManagerNotifiedEvents'] = comanager_notified_events
 
-        # Métadonnées Goodflag : champs data1-data16
+        # Champs data1-data16
         if metadata and isinstance(metadata, dict):
             for key, value in metadata.items():
                 if key.startswith('data') and key[4:].isdigit():
@@ -417,8 +305,8 @@ class GoodflagClient:
         status = data.get('workflowStatus', 'draft')
 
         logger.info(
-            "Goodflag workflow created: workflow_id=%s, status=%s, external_ref=%s",
-            workflow_id, status, external_ref
+            "Goodflag workflow created: workflow_id=%s, status=%s",
+            workflow_id, status
         )
 
         return {
@@ -433,23 +321,9 @@ class GoodflagClient:
                         create_documents=True,
                         ignore_attachments=False):
         """
-        Upload un document dans un workflow Goodflag via l'endpoint parts.
+        Upload un document via POST /api/workflows/{id}/parts.
 
-        L'API Goodflag utilise :
-        POST /api/workflows/{workflowId}/parts?createDocuments=true
-             &signatureProfileId=...
-
-        Le document est envoyé en multipart form-data.
-
-        Args:
-            workflow_id: identifiant du workflow
-            file_content: contenu binaire du fichier (bytes)
-            filename: nom du fichier
-            content_type: type MIME (seul application/pdf autorisé par défaut)
-            signature_profile_id: profil de signature pour ce document.
-                Si vide, le document sera une pièce jointe (attachment).
-            create_documents: créer automatiquement les documents (défaut: True)
-            ignore_attachments: ignorer les pièces jointes (défaut: False)
+        Le fichier est envoyé en binaire brut avec Content-Disposition.
         """
         if content_type not in ALLOWED_CONTENT_TYPES:
             raise GoodflagValidationError(
@@ -472,17 +346,11 @@ class GoodflagClient:
         }
         if signature_profile_id:
             params['signatureProfileId'] = signature_profile_id
-
-        # Conversion automatique en PDF pour les formats non-PDF
         if content_type != 'application/pdf':
             params['convertToPdf'] = 'true'
 
-        # L'API Goodflag attend le fichier en corps binaire brut
-        # (pas multipart) avec Content-Disposition et Content-Type en headers.
-        # Un filename vide dans Content-Disposition provoque un rejet HTTP 400
-        # par le proxy Apache devant l'application Goodflag.
-        # Sanitisation du nom de fichier : supprimer les caractères de contrôle
-        # qui permettraient une injection de header HTTP (CRLF injection).
+        # Envoi en binaire brut (pas multipart) : Goodflag attend
+        # Content-Disposition + Content-Type en headers.
         raw_filename = filename or 'document.pdf'
         safe_filename = raw_filename.replace('\r', '').replace('\n', '').replace('"', "'")
         upload_headers = {
@@ -505,11 +373,8 @@ class GoodflagClient:
                 response_data=getattr(exc, 'response_data', None),
             ) from exc
 
-        # La réponse contient documents[] avec les documents créés
         documents = data.get('documents', [])
-        doc_id = ''
-        if documents:
-            doc_id = documents[0].get('id', '')
+        doc_id = documents[0].get('id', '') if documents else ''
 
         logger.info(
             "Document uploaded: workflow_id=%s, document_id=%s, filename=%s",
@@ -528,31 +393,22 @@ class GoodflagClient:
     def upload_documents(self, workflow_id, files_list,
                          create_documents=True,
                          ignore_attachments=False):
-        """
-        Upload plusieurs documents d'un coup dans un workflow Goodflag.
-
-        files_list doit être une liste de dict :
-        [{'content': b'...', 'filename': 'a.pdf', 'content_type': '...',
-          'signature_profile_id': 'sip_...'}, ...]
-        """
+        """Upload plusieurs documents en une seule requête multipart."""
         params = {
             'createDocuments': str(create_documents).lower(),
             'ignoreAttachments': str(ignore_attachments).lower(),
         }
 
-        # Construction du multipart avec plusieurs fichiers
         files = []
         for i, f in enumerate(files_list):
             content = f['content']
             if isinstance(content, str):
                 content = base64.b64decode(content)
-
             filename = f.get('filename', f'file_{i}.pdf')
             ctype = f.get('content_type', 'application/pdf')
-            # Note: signatureProfileId is global for the whole request in /parts
             files.append(('document', (filename, io.BytesIO(content), ctype)))
 
-        # Si un seul profil pour tous :
+        # Si tous les fichiers ont le même profil de signature, on le passe en global
         first_profile = files_list[0].get('signature_profile_id') if files_list else None
         if all(f.get('signature_profile_id') == first_profile for f in files_list):
             if first_profile:
@@ -577,13 +433,7 @@ class GoodflagClient:
         }
 
     def start_workflow(self, workflow_id):
-        """
-        Démarre un workflow Goodflag en passant son statut à 'started'.
-
-        L'API Goodflag utilise :
-        PATCH /api/workflows/{workflowId}
-        {"workflowStatus": "started"}
-        """
+        """Démarre un workflow (PATCH workflowStatus -> started)."""
         logger.info("Starting Goodflag workflow: %s", workflow_id)
 
         data = self._request(
@@ -593,10 +443,7 @@ class GoodflagClient:
         )
 
         status = data.get('workflowStatus', 'started')
-        logger.info(
-            "Goodflag workflow started: workflow_id=%s, status=%s",
-            workflow_id, status
-        )
+        logger.info("Goodflag workflow started: %s, status=%s", workflow_id, status)
 
         return {
             'workflow_id': data.get('id', workflow_id),
@@ -605,12 +452,7 @@ class GoodflagClient:
         }
 
     def stop_workflow(self, workflow_id):
-        """
-        Arrête un workflow Goodflag (statut 'stopped').
-
-        PATCH /api/workflows/{workflowId}
-        {"workflowStatus": "stopped"}
-        """
+        """Arrête un workflow (PATCH workflowStatus -> stopped)."""
         logger.info("Stopping Goodflag workflow: %s", workflow_id)
 
         data = self._request(
@@ -619,20 +461,14 @@ class GoodflagClient:
             json_data={'workflowStatus': 'stopped'},
         )
 
-        status = data.get('workflowStatus', 'stopped')
         return {
             'workflow_id': data.get('id', workflow_id),
-            'status': status,
+            'status': data.get('workflowStatus', 'stopped'),
             'raw': data,
         }
 
     def archive_workflow(self, workflow_id):
-        """
-        Archive un workflow Goodflag (statut 'archived').
-
-        PATCH /api/workflows/{workflowId}
-        {"workflowStatus": "archived"}
-        """
+        """Archive un workflow (PATCH workflowStatus -> archived)."""
         logger.info("Archiving Goodflag workflow: %s", workflow_id)
 
         data = self._request(
@@ -641,25 +477,20 @@ class GoodflagClient:
             json_data={'workflowStatus': 'archived'},
         )
 
-        status = data.get('workflowStatus', 'archived')
         return {
             'workflow_id': data.get('id', workflow_id),
-            'status': status,
+            'status': data.get('workflowStatus', 'archived'),
             'raw': data,
         }
 
     def get_workflow(self, workflow_id):
-        """
-        Récupère le détail d'un workflow Goodflag.
-
-        GET /api/workflows/{workflowId}
-        """
+        """Récupère le détail d'un workflow (GET /api/workflows/{id})."""
         data = self._request('GET', f'/workflows/{workflow_id}')
 
         raw_status = data.get('workflowStatus', 'draft')
         normalized_status = self.normalize_status(raw_status)
 
-        return {
+        result = {
             'workflow_id': data.get('id', workflow_id),
             'status': raw_status,
             'normalized_status': normalized_status,
@@ -675,25 +506,21 @@ class GoodflagClient:
             'finished': data.get('finished'),
             'created': data.get('created'),
             'updated': data.get('updated'),
-            # Métadonnées data1-data16
-            **{f'data{i}': data.get(f'data{i}', '')
-               for i in range(1, MAX_METADATA_SLOTS + 1)
-               if data.get(f'data{i}')},
             'raw': data,
         }
+        # Métadonnées data1-data16
+        for i in range(1, MAX_METADATA_SLOTS + 1):
+            val = data.get(f'data{i}')
+            if val:
+                result[f'data{i}'] = val
+
+        return result
 
     def create_invite(self, workflow_id, recipient_email, recipient_phone=None):
-        """
-        Crée une invitation pour un destinataire d'un workflow.
-
-        POST /api/workflows/{workflowId}/invite
-        {"recipientEmail": "...", "recipientPhone": "..."}
-
-        Retourne l'URL d'invitation.
-        """
+        """Crée une invitation (POST /api/workflows/{id}/invite)."""
         logger.info(
-            "Creating invite for workflow %s, recipient=%s, phone=%s",
-            workflow_id, recipient_email, recipient_phone
+            "Creating invite for workflow %s, recipient=%s",
+            workflow_id, recipient_email
         )
 
         payload = {'recipientEmail': recipient_email}
@@ -713,12 +540,7 @@ class GoodflagClient:
         }
 
     def send_invite(self, workflow_id, recipient_email):
-        """
-        Envoie une invitation par email à un destinataire.
-
-        POST /api/workflows/{workflowId}/sendInvite
-        {"recipientEmail": "..."}
-        """
+        """Envoie une invitation par email (POST /api/workflows/{id}/sendInvite)."""
         logger.info(
             "Sending invite for workflow %s, recipient=%s",
             workflow_id, recipient_email
@@ -738,21 +560,15 @@ class GoodflagClient:
 
     def download_documents(self, workflow_id, streaming=False):
         """
-        Télécharge les documents signés d'un workflow terminé.
+        Télécharge les documents signés (GET /api/workflows/{id}/downloadDocuments).
 
-        GET /api/workflows/{workflowId}/downloadDocuments
         Retourne un PDF ou un ZIP si plusieurs documents.
-        Si streaming=True, retourne la réponse brute pour un StreamingHttpResponse.
         """
         logger.info("Downloading signed documents for workflow %s", workflow_id)
 
         url = self._url(f'/workflows/{workflow_id}/downloadDocuments')
         try:
-            response = self.session.get(
-                url,
-                timeout=self.timeout,
-                stream=streaming,
-            )
+            response = self.session.get(url, timeout=self.timeout, stream=streaming)
         except requests.exceptions.Timeout:
             raise GoodflagTimeoutError(
                 f"Timeout after {self.timeout}s downloading documents for {workflow_id}"
@@ -783,11 +599,7 @@ class GoodflagClient:
         }
 
     def get_document_viewer_url(self, document_id, redirect_url=None, expired=None):
-        """
-        Génère une URL de viewer pour un document (visualisation / placement).
-
-        POST /api/documents/{documentId}/viewer
-        """
+        """Génère une URL de viewer pour un document."""
         payload = {}
         if redirect_url:
             payload['redirectUrl'] = redirect_url
@@ -807,24 +619,15 @@ class GoodflagClient:
         }
 
     def download_evidence_certificate(self, workflow_id, streaming=False):
-        """
-        Télécharge le certificat de preuve d'un workflow.
-
-        GET /api/workflows/{workflowId}/downloadEvidenceCertificate
-        Si streaming=True, retourne la réponse brute pour un StreamingHttpResponse.
-        """
+        """Télécharge le certificat de preuve d'un workflow."""
         logger.info("Downloading evidence certificate for workflow %s", workflow_id)
 
         url = self._url(f'/workflows/{workflow_id}/downloadEvidenceCertificate')
         try:
-            response = self.session.get(
-                url,
-                timeout=self.timeout,
-                stream=streaming,
-            )
+            response = self.session.get(url, timeout=self.timeout, stream=streaming)
         except requests.exceptions.Timeout:
             raise GoodflagTimeoutError(
-                f"Timeout after {self.timeout}s downloading evidence certificate for {workflow_id}"
+                f"Timeout after {self.timeout}s downloading evidence for {workflow_id}"
             )
         except requests.exceptions.RequestException as exc:
             raise GoodflagError(f"Error downloading evidence certificate: {exc}")
@@ -852,25 +655,13 @@ class GoodflagClient:
         }
 
     def get_webhook_event(self, webhook_event_id):
-        """
-        Récupère un événement webhook pour validation.
-
-        GET /api/webhookEvents/{webhookEventId}
-
-        Utilisé pour re-valider les événements webhook reçus,
-        car Goodflag ne signe pas ses webhooks (pas de HMAC).
-        """
-        data = self._request('GET', f'/webhookEvents/{webhook_event_id}')
-        return data
+        """Récupère un événement webhook pour re-validation (pas de HMAC côté Goodflag)."""
+        return self._request('GET', f'/webhookEvents/{webhook_event_id}')
 
     def search_workflows(self, text=None, items_per_page=50, page_index=0,
                          sort_by='items.created', sort_order='desc',
                          filters=None):
-        """
-        Recherche dans les workflows.
-
-        GET /api/workflows?text=...&itemsPerPage=50&pageIndex=0
-        """
+        """Recherche dans les workflows (GET /api/workflows)."""
         params = {
             'itemsPerPage': items_per_page,
             'pageIndex': page_index,
@@ -882,15 +673,8 @@ class GoodflagClient:
         if filters and isinstance(filters, dict):
             params.update(filters)
 
-        data = self._request('GET', '/workflows', params=params)
-        return data
+        return self._request('GET', '/workflows', params=params)
 
     def normalize_status(self, raw_status):
-        """
-        Normalise un statut Goodflag en statut simplifié Publik.
-
-        Statuts Goodflag réels : draft, started, stopped, finished
-        Statuts normalisés Publik : draft, started, pending, finished,
-                                     refused, cancelled, error
-        """
+        """Normalise un statut Goodflag vers Publik (draft/started/finished/refused/error)."""
         return STATUS_MAP.get(raw_status, 'error')

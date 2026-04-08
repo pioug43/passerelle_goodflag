@@ -1,10 +1,3 @@
-"""
-Tests d'intégration du connecteur Goodflag (endpoints Passerelle).
-
-Utilise responses pour mocker les appels HTTP vers l'API Goodflag
-et django.test.RequestFactory pour simuler les requêtes Passerelle.
-"""
-
 import base64
 import json
 
@@ -13,6 +6,7 @@ import responses
 from django.test import RequestFactory
 from django.utils import timezone
 
+from passerelle_goodflag.exceptions import GoodflagError, GoodflagValidationError
 from passerelle_goodflag.models import (
     GoodflagDocumentTrace,
     GoodflagResource,
@@ -101,7 +95,6 @@ class TestCreateWorkflow:
         assert data['workflow_id'] == 'wfl_Test001'
         assert data['status'] == 'draft'
 
-        # Vérification de la trace locale
         trace = GoodflagWorkflowTrace.objects.get(
             resource=connector,
             goodflag_workflow_id='wfl_Test001',
@@ -136,7 +129,6 @@ class TestCreateWorkflow:
         result = connector.create_workflow(request)
         assert result['data']['workflow_id'] == 'wfl_Test001'
 
-        # Vérification que le consentPageId par défaut est injecté
         sent = responses.calls[0].request
         body = json.loads(sent.body)
         assert body['steps'][0]['stepType'] == 'signature'
@@ -146,7 +138,6 @@ class TestCreateWorkflow:
         )
 
     def test_missing_name(self, connector, factory):
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         payload = {'recipients': [{'email': 'a@b.com'}]}
         request = factory.post(
             '/create-workflow',
@@ -157,7 +148,6 @@ class TestCreateWorkflow:
             connector.create_workflow(request)
 
     def test_missing_recipients_and_steps(self, connector, factory):
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         payload = {'name': 'Test'}
         request = factory.post(
             '/create-workflow',
@@ -168,7 +158,6 @@ class TestCreateWorkflow:
             connector.create_workflow(request)
 
     def test_invalid_json(self, connector, factory):
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         request = factory.post(
             '/create-workflow',
             data='not json',
@@ -179,7 +168,6 @@ class TestCreateWorkflow:
 
     @responses.activate
     def test_api_error(self, connector, factory):
-        from passerelle_goodflag.exceptions import GoodflagError
         responses.add(
             responses.POST,
             f'{BASE_URL}/users/{USER_ID}/workflows',
@@ -228,7 +216,6 @@ class TestUploadDocument:
         data = result['data']
         assert data['document_id'] == 'doc_Doc001'
 
-        # Vérification de la trace document
         doc_trace = GoodflagDocumentTrace.objects.get(
             resource=connector,
             goodflag_document_id='doc_Doc001',
@@ -275,7 +262,6 @@ class TestUploadDocument:
         uploaded_file = SimpleUploadedFile('multipart.pdf', pdf_bytes, content_type='application/pdf')
 
         payload = {'workflow_id': 'wfl_Test001'}
-        # Simulate a multipart request with files
         request = factory.post(
             '/upload-document',
             data=payload,
@@ -285,7 +271,6 @@ class TestUploadDocument:
         result = connector.upload_document(request)
         assert result['data']['document_id'] == 'doc_Doc001'
 
-        # Verify filename from multipart
         doc_trace = GoodflagDocumentTrace.objects.get(
             resource=connector,
             goodflag_document_id='doc_Doc001',
@@ -293,7 +278,6 @@ class TestUploadDocument:
         assert doc_trace.filename == 'multipart.pdf'
 
     def test_missing_workflow_id(self, connector, factory):
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         payload = {'file_base64': 'abc', 'filename': 'test.pdf'}
         request = factory.post(
             '/upload-document',
@@ -304,7 +288,6 @@ class TestUploadDocument:
             connector.upload_document(request)
 
     def test_missing_file(self, connector, factory):
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         payload = {'workflow_id': 'wfl_001', 'filename': 'test.pdf'}
         request = factory.post(
             '/upload-document',
@@ -341,14 +324,12 @@ class TestStartWorkflow:
         result = connector.start_workflow(request)
         assert result['data']['status'] == 'started'
 
-        # Vérification de la mise à jour de la trace
         trace = GoodflagWorkflowTrace.objects.get(
             resource=connector,
             goodflag_workflow_id='wfl_Test001',
         )
         assert trace.status == 'started'
 
-        # Vérification du payload envoyé
         sent = responses.calls[0].request
         body = json.loads(sent.body)
         assert body['workflowStatus'] == 'started'
@@ -404,17 +385,14 @@ class TestSubmitWorkflow:
         assert data['status'] == 'started'
         assert data['document_id'] == 'doc_Doc001'
 
-        # 4 appels API : POST workflow, GET file_url, POST parts, PATCH start
         assert len(responses.calls) == 4
 
-        # Trace workflow créée avec statut started
         trace = GoodflagWorkflowTrace.objects.get(
             resource=connector, goodflag_workflow_id='wfl_Test001',
         )
         assert trace.status == 'started'
         assert trace.external_ref == 'DEM-2024-001'
 
-        # Trace document créée
         doc = GoodflagDocumentTrace.objects.get(
             resource=connector, goodflag_workflow_id='wfl_Test001',
         )
@@ -483,7 +461,6 @@ class TestSubmitWorkflow:
             data=json.dumps(payload),
             content_type='application/json',
         )
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         with pytest.raises(GoodflagValidationError):
             connector.submit_workflow(request)
 
@@ -538,7 +515,6 @@ class TestSyncStatus:
         assert data['status'] == 'finished'
         assert data['is_final'] is True
         assert data['progress'] == 100
-        # La trace est mise à jour
         trace = GoodflagWorkflowTrace.objects.get(
             resource=connector, goodflag_workflow_id='wfl_Test001')
         assert trace.status == 'finished'
@@ -687,7 +663,6 @@ class TestDownloadSignedDocuments:
     @responses.activate
     def test_goodflag_api_error_is_propagated(self, connector, factory):
         """Si Goodflag renvoie une erreur HTTP, elle est propagée proprement."""
-        from passerelle_goodflag.exceptions import GoodflagError
         responses.add(
             responses.GET,
             f'{BASE_URL}/workflows/wfl_Test001/downloadDocuments',
@@ -703,14 +678,12 @@ class TestWebhook:
     @responses.activate
     def test_nominal_with_verification(self, connector, factory):
         """Webhook avec token URL valide + re-validation API."""
-        # Mock pour la vérification de l'événement webhook
         responses.add(
             responses.GET,
             f'{BASE_URL}/webhookEvents/wbe_Event001',
             json=MOCK_WEBHOOK_EVENT,
             status=200,
         )
-        # Mock pour la récupération du statut workflow
         responses.add(
             responses.GET,
             f'{BASE_URL}/workflows/wfl_Test001',
@@ -742,7 +715,6 @@ class TestWebhook:
             data=json.dumps(payload),
             content_type='application/json',
         )
-        # Django test RequestFactory encode les query params dans META
         request.GET = {'token': 'webhook-secret-token'}
         response = connector.webhook(request)
 
@@ -750,7 +722,6 @@ class TestWebhook:
         data = json.loads(response.content)
         assert data['status'] == 'ok'
 
-        # Vérification de l'enregistrement
         event = GoodflagWebhookEvent.objects.get(
             resource=connector,
             event_id='wbe_Event001',
@@ -917,7 +888,6 @@ class TestRetrieveByExternalRef:
         assert result['data']['count'] == 0
 
     def test_missing_ref(self, connector, factory):
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         request = factory.get('/retrieve-by-external-ref')
         with pytest.raises(GoodflagValidationError, match='external_ref'):
             connector.retrieve_by_external_ref(request, external_ref='')
@@ -1118,7 +1088,6 @@ class TestResendInvite:
         assert result['data']['invite_url'] == 'https://sign.example.com/invite/abc'
 
     def test_missing_recipient_email(self, connector, factory):
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         payload = {'workflow_id': 'wfl_Test001'}
         request = factory.post(
             '/resend-invite',
@@ -1296,20 +1265,17 @@ class TestValidateFileContent:
 
     def test_invalid_pdf_raises(self):
         from passerelle_goodflag.models import _validate_file_content
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         with pytest.raises(GoodflagValidationError, match='%PDF'):
             _validate_file_content(b'not a pdf', 'application/pdf')
 
     def test_encrypted_pdf_raises(self):
         from passerelle_goodflag.models import _validate_file_content
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         encrypted = b'%PDF-1.4 ' + b'/Encrypt some content'
         with pytest.raises(GoodflagValidationError, match='chiffrement'):
             _validate_file_content(encrypted, 'application/pdf')
 
     def test_empty_file_raises(self):
         from passerelle_goodflag.models import _validate_file_content
-        from passerelle_goodflag.exceptions import GoodflagValidationError
         with pytest.raises(GoodflagValidationError, match='vide'):
             _validate_file_content(b'', 'application/pdf')
 

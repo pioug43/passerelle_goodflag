@@ -1,12 +1,4 @@
-"""
-Administration Django pour le connecteur Goodflag.
-
-Enregistre les modèles de persistance dans l'interface d'administration
-Django de Passerelle pour permettre la supervision sans accès SQL direct.
-"""
-
 from django.contrib import admin
-from django.utils.translation import gettext_lazy as _
 
 from .models import (
     GoodflagDocumentTrace,

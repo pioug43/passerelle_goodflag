@@ -5,41 +5,54 @@ GoodflagResource : connecteur Passerelle (hérite de BaseResource)
 GoodflagWorkflowTrace : corrélation workflow Goodflag / demande Publik
 GoodflagWebhookEvent : journalisation des webhooks reçus
 GoodflagDocumentTrace : métadonnées des documents uploadés / signés
+
+La logique métier est extraite dans des services dédiés (services/) :
+- file_validation : validation fichiers, SSRF, base64
+- workflow_resolver : résolution workflow_id / external_ref
+- webhook : traitement des webhooks, anti-rejeu, notification WCS
+- download : construction des réponses HTTP de téléchargement
 """
 
-import base64
-import hmac
-import io
-import ipaddress
 import json
 import logging
-import time
-import zipfile
-from urllib.parse import urlparse
 
 from django.core.cache import cache
 from django.db import models
-from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
+from django.http import JsonResponse
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from passerelle.base.models import BaseResource
 from passerelle.utils.api import endpoint
 
-from .client import GoodflagClient, _sanitize_for_log
+from .client import GoodflagClient
 from .exceptions import (
     GoodflagError,
     GoodflagRateLimitError,
     GoodflagValidationError,
 )
+from .services.download import build_download_response
+from .services.file_validation import (
+    MAX_B64_LEN,
+    parse_file_from_payload,
+    safe_b64decode,
+    sniff_content_type,
+    validate_file_content,
+)
+from .services.webhook import (
+    NOTIFY_EVENT_TYPES,
+    check_replay,
+    notify_wcs,
+    record_event,
+    validate_webhook_token,
+    verify_and_fetch_status,
+)
+from .services.workflow_resolver import resolve_workflow_id
 
 logger = logging.getLogger(__name__)
 
 # Statuts finaux d'un workflow Goodflag (utilisés dans hourly, sync_status, webhook)
 _FINAL_STATUSES = frozenset({'finished', 'refused'})
-
-# Taille max d'un fichier encodé en base64 (~50 Mo décodé)
-_MAX_B64_LEN = int(50 * 1024 * 1024 * 4 / 3) + 1024
 
 # Clés PII à masquer dans les logs debug
 _PII_KEYS = frozenset({
@@ -48,124 +61,6 @@ _PII_KEYS = frozenset({
     'phoneNumber', 'phone', 'file', 'file_base64', 'file_url',
     'content',
 })
-
-
-def _sniff_content_type(content, declared_type):
-    """
-    Détecte le type MIME réel d'un fichier par ses magic bytes.
-
-    WCS renvoie souvent Content-Type: text/html ou application/octet-stream
-    même pour des PDFs valides. On se base sur le contenu réel.
-    """
-    if content[:4] == b'%PDF':
-        return 'application/pdf'
-    if content[:4] == b'PK\x03\x04':
-        return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    if content[:3] in (b'\xff\xd8\xff',):
-        return 'image/jpeg'
-    if content[:8] == b'\x89PNG\r\n\x1a\n':
-        return 'image/png'
-    # Aucun magic byte reconnu : garder le type déclaré
-    return declared_type
-
-
-def _validate_file_url(url):
-    """
-    Valide qu'une URL de fichier ne pointe pas vers une ressource interne
-    (protection contre les attaques SSRF).
-
-    Rejette :
-    - Schémas non-HTTP (file://, ftp://, gopher://, etc.)
-    - Adresses IP privées / loopback / link-local / réservées
-    - Hostname résolu vers une adresse privée (non vérifié ici — résolution DNS
-      hors scope, mais le schéma et la forme littérale sont contrôlés)
-
-    Lève GoodflagValidationError si l'URL est suspecte.
-    """
-    if not url:
-        raise GoodflagValidationError("file_url is required")
-    parsed = urlparse(url)
-    if parsed.scheme not in ('http', 'https'):
-        raise GoodflagValidationError(
-            f"file_url scheme '{parsed.scheme}' not allowed (http/https only)"
-        )
-    hostname = parsed.hostname or ''
-    # Rejeter les IP littérales privées / réservées
-    try:
-        addr = ipaddress.ip_address(hostname)
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast):
-            raise GoodflagValidationError(
-                f"file_url points to a non-routable address: {hostname}"
-            )
-    except ValueError:
-        # Nom de domaine — on accepte, la résolution DNS n'est pas contrôlée ici
-        pass
-    # Rejeter les hostnames clairement locaux
-    local_patterns = ('localhost', '127.', '0.0.0.0', '::1', 'metadata.google',
-                      '169.254.', 'metadata.internal')
-    for pat in local_patterns:
-        if hostname.lower().startswith(pat) or hostname.lower() == pat.rstrip('.'):
-            raise GoodflagValidationError(
-                f"file_url points to a local/internal address: {hostname}"
-            )
-
-
-def _validate_file_content(content, content_type):
-    """
-    Valide le contenu d'un fichier avant upload vers Goodflag.
-
-    Vérifie :
-    - PDF : signature magique, absence de chiffrement, non vide
-    - DOCX : signature ZIP (PK\\x03\\x04), fichier word/_rels/document.xml.rels présent
-    - Taille non nulle
-
-    Lève GoodflagValidationError si le fichier est invalide.
-    """
-    if not content:
-        raise GoodflagValidationError("Le fichier est vide")
-
-    # Détection du type réel par magic bytes, indépendamment du content_type déclaré.
-    # WCS peut servir un PDF avec Content-Type: application/octet-stream.
-    is_pdf_by_content = content.startswith(b'%PDF')
-    is_pdf_by_type = 'pdf' in content_type.lower()
-
-    if is_pdf_by_content or is_pdf_by_type:
-        # Si le type déclaré dit PDF mais que les bytes ne correspondent pas,
-        # c'est une erreur réelle (ex: HTML de login renvoyé à la place du fichier).
-        if is_pdf_by_type and not is_pdf_by_content:
-            raise GoodflagValidationError(
-                "Le fichier n'est pas un PDF valide (signature %PDF manquante). "
-                "Vérifiez que l'URL du document est accessible et retourne bien un PDF."
-            )
-        # Détection PDF chiffré : cherche /Encrypt dans les 2048 premiers octets
-        # ou dans les 512 derniers (où se trouve souvent le trailer)
-        probe = content[:2048] + content[-512:]
-        if b'/Encrypt' in probe:
-            raise GoodflagValidationError(
-                "Le PDF est protégé par chiffrement. "
-                "Goodflag ne peut pas signer un PDF chiffré. "
-                "Déchiffrez le document avant de l'uploader."
-            )
-
-    elif 'wordprocessingml' in content_type or 'docx' in content_type.lower():
-        # Vérification signature ZIP (DOCX = ZIP)
-        if not content.startswith(b'PK\x03\x04'):
-            raise GoodflagValidationError(
-                "Le fichier DOCX n'est pas valide (signature ZIP manquante)"
-            )
-        # Vérification structure interne DOCX minimale
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as zf:
-                names = zf.namelist()
-                if 'word/document.xml' not in names:
-                    raise GoodflagValidationError(
-                        "Le fichier DOCX est corrompu (word/document.xml manquant)"
-                    )
-        except zipfile.BadZipFile:
-            raise GoodflagValidationError(
-                "Le fichier DOCX est corrompu (archive ZIP invalide)"
-            )
 
 
 class GoodflagResource(BaseResource):
@@ -431,35 +326,8 @@ class GoodflagResource(BaseResource):
             logger.info("[GOODFLAG DEBUG] " + message, *args)
 
     def _resolve_workflow_id(self, payload):
-        """
-        Résout le workflow_id depuis le payload.
-
-        Cherche d'abord workflow_id directement, puis utilise external_ref
-        comme fallback pour retrouver le workflow depuis la trace locale.
-        Cela permet de récupérer le workflow_id même si la variable WCS
-        goodflag_create_data_workflow_id n'a pas été correctement propagée.
-        """
-        workflow_id = self._get_param(payload, 'workflow_id')
-        if not workflow_id:
-            # Recherche de la référence externe dans plusieurs champs possibles (Publik)
-            external_ref = (
-                self._get_param(payload, 'external_ref')
-                or self._get_param(payload, 'display_id')  # ex: "12-1"
-                or self._get_param(payload, 'uuid')        # ex: "a02ca561-..."
-                # Note: 'id' retiré — trop générique, risque de collision
-            )
-            if external_ref:
-                trace = GoodflagWorkflowTrace.objects.filter(
-                    resource=self,
-                    external_ref=external_ref,
-                ).order_by('-created_at').first()
-                if trace:
-                    workflow_id = trace.goodflag_workflow_id
-                    logger.info(
-                        "Resolved workflow_id=%s from external_ref=%s",
-                        workflow_id, external_ref,
-                    )
-        return workflow_id
+        """Délègue à services.workflow_resolver.resolve_workflow_id."""
+        return resolve_workflow_id(self, payload, self._get_param)
 
     def _build_steps(self, recipients, steps_config=None):
         """
@@ -553,131 +421,19 @@ class GoodflagResource(BaseResource):
     # -- Parsing de fichier ------------------------------------------------
 
     def _parse_file_from_payload(self, payload, request):
-        """
-        Extrait le contenu d'un fichier depuis le payload ou la requête.
-
-        Priorité :
-          1. ``file`` (dict JSON) : {"filename": "...", "content_type": "...", "content": "<base64>"}
-          2. ``request.FILES['file']`` — upload multipart Django
-          3. ``file_base64`` — chaîne base64 directe
-          4. ``file_url`` — URL téléchargée via la session Passerelle signée
-          5. ``fields`` — objet de formulaire WCS complet (premier champ avec 'content')
-
-        Retourne (file_content: bytes, filename: str, content_type: str).
-        Lève GoodflagValidationError si aucune source n'est trouvable.
-        """
-        file_obj = payload.get('file')
-        if isinstance(file_obj, str) and file_obj.startswith('{'):
-            try:
-                file_obj = json.loads(file_obj)
-            except (ValueError, TypeError):
-                pass
-
-        filename = self._get_param(payload, 'filename')
-        content_type = self._get_param(payload, 'content_type', 'application/pdf')
-        file_content = None
-        file_url = None
-
-        if isinstance(file_obj, dict):
-            file_b64 = file_obj.get('content')
-            if not file_b64:
-                raise GoodflagValidationError("'content' is missing in 'file' object")
-            if len(file_b64) > _MAX_B64_LEN:
-                raise GoodflagValidationError("File content exceeds maximum allowed size (50 MB)")
-            file_content = base64.b64decode(file_b64)
-            filename = filename or file_obj.get('filename')
-            content_type = file_obj.get('content_type') or content_type
-        elif request.FILES.get('file'):
-            f = request.FILES['file']
-            file_content = f.read()
-            filename = filename or f.name
-        elif self._get_param(payload, 'file_base64'):
-            file_b64 = self._get_param(payload, 'file_base64')
-            if len(file_b64) > _MAX_B64_LEN:
-                raise GoodflagValidationError("File content exceeds maximum allowed size (50 MB)")
-            file_content = base64.b64decode(file_b64)
-        elif self._get_param(payload, 'file_url'):
-            file_url = self._get_param(payload, 'file_url')
-            _validate_file_url(file_url)
-            resp = self.requests.get(file_url)
-            if resp.status_code != 200:
-                raise GoodflagError(
-                    f"Failed to fetch file from URL: HTTP {resp.status_code}"
-                )
-            file_content = resp.content
-            # Détection du type par magic bytes — prioritaire sur le Content-Type
-            # déclaré par WCS qui peut être text/html, application/octet-stream, etc.
-            # même pour un PDF valide.
-            content_type = _sniff_content_type(file_content, content_type)
-        elif isinstance(payload.get('fields'), dict):
-            for field_val in payload['fields'].values():
-                if isinstance(field_val, dict) and 'content' in field_val:
-                    file_content = base64.b64decode(field_val['content'])
-                    filename = filename or field_val.get('filename')
-                    content_type = field_val.get('content_type') or content_type
-                    break
-
-        if not file_content:
-            raise GoodflagValidationError(
-                "'file' object, 'file_base64', 'file_url' or valid 'fields' is required"
-            )
-
-        _validate_file_content(file_content, content_type)
-
-        if not filename and file_url:
-            from urllib.parse import urlparse, unquote
-            path = urlparse(file_url).path
-            filename = unquote(path.rstrip('/').rsplit('/', 1)[-1]) or ''
-        filename = filename or 'document.pdf'
-
-        return file_content, filename, content_type
+        """Délègue à services.file_validation.parse_file_from_payload."""
+        return parse_file_from_payload(
+            payload, request, self._get_param, self.requests,
+        )
 
     # -- Notification WCS --------------------------------------------------
 
-    _NOTIFY_EVENT_TYPES = frozenset({
-        'workflowFinished', 'workflowStopped', 'workflowStarted',
-        'recipientFinished', 'recipientRefused',
-    })
-
     def _notify_wcs(self, workflow_id, event_type, normalized_status, event_id=''):
-        """
-        Notifie WCS d'un changement de statut via le publik_callback_url global.
-
-        Utilise self.requests (session Passerelle avec signature d'URL) pour
-        que WCS accepte l'appel.
-        """
-        callback_url = self.publik_callback_url
-        if not callback_url:
-            return
-
-        payload = {
-            'event_type': event_type,
-            'workflow_id': workflow_id,
-            'status': normalized_status,
-            'event_id': event_id,
-        }
-
-        try:
-            cb_response = self.requests.post(
-                callback_url,
-                json=payload,
-                timeout=10,
-            )
-            if cb_response.status_code >= 400:
-                logger.warning(
-                    "WCS callback failed: HTTP %s for workflow %s (url=%s)",
-                    cb_response.status_code, workflow_id, callback_url,
-                )
-            else:
-                logger.info(
-                    "WCS callback OK: workflow=%s, status=%s, HTTP %s",
-                    workflow_id, normalized_status, cb_response.status_code,
-                )
-        except Exception as exc:
-            logger.warning(
-                "WCS callback exception for workflow %s: %s (url=%s)",
-                workflow_id, exc, callback_url,
-            )
+        """Délègue à services.webhook.notify_wcs."""
+        notify_wcs(
+            self.requests, self.publik_callback_url,
+            workflow_id, event_type, normalized_status, event_id,
+        )
 
     # -- Disponibilité et tâches planifiées --------------------------------
 
@@ -1235,7 +991,7 @@ class GoodflagResource(BaseResource):
         description=_('Upload un document dans un workflow Goodflag existant'),
         long_description=_(
             'Charge un document PDF/DOCX dans un workflow déjà créé. '
-            'Le document peut être fourni de 4 façons :\n\n'
+            'Le document peut être fourni de 5 façons (par ordre de priorité) :\n\n'
             '1. Objet JSON imbriqué (recommandé) :\n'
             '{\n'
             '  "workflow_id": "wfl_xxx",\n'
@@ -1245,15 +1001,18 @@ class GoodflagResource(BaseResource):
             '    "content": "<base64>"\n'
             '  }\n'
             '}\n\n'
-            '2. URL Publik (le serveur Passerelle télécharge le fichier) :\n'
+            '2. Multipart Django (champ "file" dans la requête multipart)\n\n'
+            '3. Base64 directe :\n'
+            '{"workflow_id": "wfl_xxx", "file_base64": "<base64>", "filename": "convention.pdf"}\n\n'
+            '4. URL Publik (le serveur Passerelle télécharge le fichier) :\n'
             '{\n'
             '  "workflow_id": "wfl_xxx",\n'
             '  "file_url": "{{ form_var_document_pdf_url }}",\n'
             '  "filename": "convention.pdf"\n'
             '}\n\n'
-            '3. Base64 directe :\n'
-            '{"workflow_id": "wfl_xxx", "file_base64": "<base64>", "filename": "convention.pdf"}\n\n'
-            '4. Multipart Django (champ "file" dans la requête multipart)\n\n'
+            '5. Champs de formulaire WCS (objet "fields" avec un champ contenant "content") :\n'
+            '{"workflow_id": "wfl_xxx", "fields": {"field_0": {"filename": "doc.pdf", '
+            '"content_type": "application/pdf", "content": "<base64>"}}}\n\n'
             'Réponse : {"data": {"document_id": "doc_xxx", "workflow_id": "wfl_xxx", '
             '"filename": "convention.pdf", "documents": [...], "parts": [...]}}'
         ),
@@ -1373,12 +1132,12 @@ class GoodflagResource(BaseResource):
             if not content_b64:
                 continue
 
-            if len(content_b64) > _MAX_B64_LEN:
+            if len(content_b64) > MAX_B64_LEN:
                 raise GoodflagValidationError("File content exceeds maximum allowed size (50 MB)")
-            file_content = base64.b64decode(content_b64)
+            file_content = safe_b64decode(content_b64, field_name='files[].file_base64')
             content_type = f.get('content_type', 'application/pdf')
-            content_type = _sniff_content_type(file_content, content_type)
-            _validate_file_content(file_content, content_type)
+            content_type = sniff_content_type(file_content, content_type)
+            validate_file_content(file_content, content_type)
 
             files_list.append({
                 'content': file_content,
@@ -1751,10 +1510,6 @@ class GoodflagResource(BaseResource):
                 "'workflow_id' or 'external_ref' is required"
             )
 
-        # Pas de pré-vérification du statut ici : c'est la condition de saut
-        # WCS (<type>django</type>) qui contrôle la transition.
-        # Si Goodflag refuse le download (workflow pas terminé),
-        # l'API renverra une erreur HTTP que l'on propage.
         client = self._get_client()
         try:
             result = client.download_documents(workflow_id, streaming=True)
@@ -1765,24 +1520,7 @@ class GoodflagResource(BaseResource):
             )
             raise
 
-        if 'response' in result:
-            streaming_response = StreamingHttpResponse(
-                result['response'].iter_content(chunk_size=8192),
-                content_type=result['content_type'],
-            )
-            streaming_response['Content-Disposition'] = (
-                f'attachment; filename="{result["filename"]}"'
-            )
-            return streaming_response
-
-        response = HttpResponse(
-            result.get('content', b''),
-            content_type=result['content_type'],
-        )
-        response['Content-Disposition'] = (
-            f'attachment; filename="{result["filename"]}"'
-        )
-        return response
+        return build_download_response(result)
 
     @endpoint(
         name='get-viewer-url',
@@ -1845,26 +1583,7 @@ class GoodflagResource(BaseResource):
 
         client = self._get_client()
         result = client.download_evidence_certificate(workflow_id, streaming=True)
-
-        if 'response' in result:
-            # Mode streaming
-            streaming_response = StreamingHttpResponse(
-                result['response'].iter_content(chunk_size=8192),
-                content_type=result['content_type'],
-            )
-            streaming_response['Content-Disposition'] = (
-                f'attachment; filename="{result["filename"]}"'
-            )
-            return streaming_response
-
-        response = HttpResponse(
-            result['content'],
-            content_type=result['content_type'],
-        )
-        response['Content-Disposition'] = (
-            f'attachment; filename="{result["filename"]}"'
-        )
-        return response
+        return build_download_response(result)
 
     @endpoint(
         name='webhook',
@@ -1890,14 +1609,9 @@ class GoodflagResource(BaseResource):
         - Journalisation complète.
         """
         # Validation par token URL si configuré
-        if self.webhook_secret:
-            provided_token = request.GET.get('token', '')
-            if not hmac.compare_digest(provided_token, self.webhook_secret):
-                logger.warning(
-                    "Webhook token validation failed: got=%s",
-                    provided_token[:4] + '...' if provided_token else '(empty)',
-                )
-                return JsonResponse({'error': 'Invalid token'}, status=403)
+        token_error = validate_webhook_token(request, self.webhook_secret)
+        if token_error:
+            return token_error
 
         try:
             payload = json.loads(request.body)
@@ -1905,95 +1619,58 @@ class GoodflagResource(BaseResource):
             logger.warning("Webhook received with invalid JSON body")
             return JsonResponse({'error': 'Invalid JSON'}, status=400)
 
-        # Structure du webhook event Goodflag
         event_id = payload.get('id', '')
         event_type = payload.get('eventType', '')
         workflow_id = payload.get('workflowId', '')
 
-        # Rejeter les webhooks sans event_id : sans lui, impossible d'assurer
-        # l'idempotence (anti-rejeu) ni la re-validation via l'API Goodflag.
         if not event_id:
             logger.warning("Webhook received without event_id, rejecting")
             return JsonResponse({'error': 'Missing event id'}, status=400)
+
         webhook_id = payload.get('webhookId', '')
         step_id = payload.get('stepId', '')
         created = payload.get('created', '')
 
         logger.info(
             "Webhook received: event_id=%s, event_type=%s, workflow_id=%s",
-            event_id, event_type, workflow_id
+            event_id, event_type, workflow_id,
         )
 
-        # Anti-rejeu : vérifier si cet événement a déjà été traité
-        if event_id:
-            already_exists = GoodflagWebhookEvent.objects.filter(
-                resource=self,
-                event_id=event_id,
-            ).exists()
-            if already_exists:
-                logger.info(
-                    "Webhook event already processed, skipping: event_id=%s",
-                    event_id
-                )
-                return JsonResponse({'status': 'already_processed'})
+        # Anti-rejeu
+        if check_replay(self, event_id):
+            logger.info(
+                "Webhook event already processed, skipping: event_id=%s",
+                event_id,
+            )
+            return JsonResponse({'status': 'already_processed'})
 
-        # Re-validation via l'API Goodflag : vérifier que l'événement
-        # existe réellement dans Goodflag
+        # Re-validation via l'API Goodflag
         raw_status = ''
         normalized_status = ''
         if event_id and workflow_id:
-            try:
-                client = self._get_client()
-                # Vérifier l'événement via l'API webhookEvents
-                verified_event = client.get_webhook_event(event_id)
-                if verified_event.get('workflowId') != workflow_id:
-                    logger.warning(
-                        "Webhook event workflowId mismatch: "
-                        "received=%s, verified=%s",
-                        workflow_id, verified_event.get('workflowId')
-                    )
-                    return JsonResponse(
-                        {'error': 'Event verification failed'}, status=403
-                    )
+            client = self._get_client()
+            raw_status, normalized_status, error_resp = verify_and_fetch_status(
+                client, event_id, workflow_id,
+            )
+            if error_resp:
+                return error_resp
 
-                # Récupérer le statut actuel du workflow
-                wf_data = client.get_workflow(workflow_id)
-                raw_status = wf_data.get('status', '')
-                normalized_status = wf_data.get('normalized_status', '')
-            except GoodflagError as exc:
-                logger.warning(
-                    "Failed to re-validate webhook via API: %s", exc
-                )
-                # On accepte quand même l'événement mais on le note
-                raw_status = 'unverified'
-                normalized_status = 'error'
-
-        # Enregistrement de l'événement
-        GoodflagWebhookEvent.objects.create(
+        # Enregistrement + mise à jour trace
+        record_event(
             resource=self,
             event_id=event_id,
             event_type=event_type,
-            goodflag_workflow_id=workflow_id,
+            workflow_id=workflow_id,
             webhook_id=webhook_id,
             step_id=step_id,
             raw_status=raw_status,
             normalized_status=normalized_status,
-            payload_json=json.dumps(payload),
-            timestamp_goodflag=str(created),
+            payload=payload,
+            created=created,
         )
 
-        # Mise à jour de la trace workflow
-        if workflow_id and normalized_status:
-            GoodflagWorkflowTrace.objects.filter(
-                resource=self,
-                goodflag_workflow_id=workflow_id,
-            ).update(
-                status=normalized_status,
-                updated_at=timezone.now(),
-            )
-
         # Notification WCS si événement significatif
-        if event_type in self._NOTIFY_EVENT_TYPES:
+        if event_type in NOTIFY_EVENT_TYPES:
             self._notify_wcs(workflow_id, event_type, normalized_status, event_id)
 
         return JsonResponse({'status': 'ok'})

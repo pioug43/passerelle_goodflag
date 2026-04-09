@@ -1291,24 +1291,24 @@ class TestDaily:
 
 class TestValidateFileContent:
     def test_valid_pdf_passes(self):
-        from passerelle_goodflag.models import _validate_file_content
+        from passerelle_goodflag.services.file_validation import validate_file_content as _validate_file_content
         _validate_file_content(b'%PDF-1.4 valid content', 'application/pdf')
 
     def test_invalid_pdf_raises(self):
-        from passerelle_goodflag.models import _validate_file_content
+        from passerelle_goodflag.services.file_validation import validate_file_content as _validate_file_content
         from passerelle_goodflag.exceptions import GoodflagValidationError
         with pytest.raises(GoodflagValidationError, match='%PDF'):
             _validate_file_content(b'not a pdf', 'application/pdf')
 
     def test_encrypted_pdf_raises(self):
-        from passerelle_goodflag.models import _validate_file_content
+        from passerelle_goodflag.services.file_validation import validate_file_content as _validate_file_content
         from passerelle_goodflag.exceptions import GoodflagValidationError
         encrypted = b'%PDF-1.4 ' + b'/Encrypt some content'
         with pytest.raises(GoodflagValidationError, match='chiffrement'):
             _validate_file_content(encrypted, 'application/pdf')
 
     def test_empty_file_raises(self):
-        from passerelle_goodflag.models import _validate_file_content
+        from passerelle_goodflag.services.file_validation import validate_file_content as _validate_file_content
         from passerelle_goodflag.exceptions import GoodflagValidationError
         with pytest.raises(GoodflagValidationError, match='vide'):
             _validate_file_content(b'', 'application/pdf')

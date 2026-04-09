@@ -20,7 +20,6 @@ Points d'intégration API Goodflag (v1.19.4) :
     POST   /api/workflows/{id}/sendInvite          -> envoyer une invitation
 """
 
-import base64
 import io
 import logging
 
@@ -37,6 +36,7 @@ from .exceptions import (
     GoodflagUploadError,
     GoodflagValidationError,
 )
+from .services.file_validation import safe_b64decode
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +458,7 @@ class GoodflagClient:
             )
 
         if isinstance(file_content, str):
-            file_content = base64.b64decode(file_content)
+            file_content = safe_b64decode(file_content, field_name='file_content')
 
         if len(file_content) > MAX_UPLOAD_SIZE:
             raise GoodflagValidationError(
@@ -545,7 +545,7 @@ class GoodflagClient:
         for i, f in enumerate(files_list):
             content = f['content']
             if isinstance(content, str):
-                content = base64.b64decode(content)
+                content = safe_b64decode(content, field_name='files[].content')
 
             filename = f.get('filename', f'file_{i}.pdf')
             ctype = f.get('content_type', 'application/pdf')

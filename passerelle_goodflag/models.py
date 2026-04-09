@@ -520,6 +520,95 @@ class GoodflagResource(BaseResource):
 
     # -- Endpoints --------------------------------------------------------
 
+    def _prepare_and_create_workflow(self, payload):
+        """
+        Prépare les données workflow et appelle l'API Goodflag pour le créer.
+
+        Factorisation partagée par create_workflow et submit_workflow :
+        validation name/recipients, résolution steps, extraction metadata,
+        appel API, persistance de la trace locale.
+
+        Retourne (workflow_id, status, client).
+        """
+        name = self._get_param(payload, 'name')
+        if not name:
+            raise GoodflagValidationError("'name' is required")
+
+        # Soit on fournit des steps natifs Goodflag, soit des recipients
+        # simplifiés (JSON) ou des paramètres plats (form W.C.S.)
+        steps_config = payload.get('steps')
+        recipients = payload.get('recipients')
+
+        if not steps_config and not recipients:
+            recipients = self._parse_multi_recipients(payload)
+
+        if not steps_config and not recipients:
+            recipient_email = self._get_param(payload, 'recipient_email')
+            if recipient_email:
+                recipients = [{
+                    'email': recipient_email,
+                    'firstName': self._get_param(payload, 'recipient_firstname', ''),
+                    'lastName': self._get_param(payload, 'recipient_lastname', ''),
+                    'phone': self._get_param(payload, 'recipient_phone', ''),
+                }]
+
+        if not steps_config and not recipients:
+            raise GoodflagValidationError(
+                "'steps' or 'recipients' is required"
+            )
+
+        steps = self._build_steps(
+            recipients=recipients or [],
+            steps_config=steps_config,
+        )
+
+        metadata = payload.get('metadata', {})
+        external_ref = self._get_param(payload, 'external_ref', '')
+        layout_id = self._get_param(payload, 'layout_id') or self.default_layout_id
+        workflow_mode = self._get_param(payload, 'workflow_mode', 'FULL')
+
+        if not self.user_id:
+            raise GoodflagValidationError(
+                "Configuration error: 'user_id' is missing in the connector settings."
+            )
+
+        client = self._get_client()
+        result = client.create_workflow(
+            user_id=self.user_id,
+            name=name,
+            steps=steps,
+            description=payload.get('description', ''),
+            workflow_mode=workflow_mode,
+            notified_events=payload.get('notified_events'),
+            watchers=payload.get('watchers'),
+            template_id=payload.get('template_id'),
+            allow_consolidation=payload.get('allow_consolidation'),
+            layout_id=layout_id,
+            metadata=metadata,
+            external_ref=external_ref,
+            allowed_comanager_users=payload.get('allowed_comanager_users'),
+            comanager_notified_events=payload.get('comanager_notified_events'),
+        )
+
+        workflow_id = result.get('workflow_id')
+        if not workflow_id:
+            raise GoodflagError(
+                "Goodflag API failed to return a workflow ID."
+            )
+
+        GoodflagWorkflowTrace.objects.update_or_create(
+            resource=self,
+            goodflag_workflow_id=workflow_id,
+            defaults={
+                'external_ref': external_ref,
+                'workflow_name': name,
+                'status': result.get('status', 'draft'),
+                'metadata_json': json.dumps(metadata),
+            },
+        )
+
+        return workflow_id, result.get('status', 'draft'), client
+
 
     @endpoint(
         name='create-workflow',
@@ -628,103 +717,10 @@ class GoodflagResource(BaseResource):
     )
     def create_workflow(self, request, **kwargs):
         payload = self._parse_payload(request, **kwargs)
-
-        name = self._get_param(payload, 'name')
-        if not name:
-            raise GoodflagValidationError("'name' is required")
-
-        # Soit on fournit des steps natifs Goodflag, soit des recipients
-        # simplifiés (JSON) ou des paramètres plats (form W.C.S.)
-        steps_config = payload.get('steps')
-        recipients = payload.get('recipients')
-
-        # Multi-signataires (format indexé ou JSON) ou signataire unique (format plat)
-        if not steps_config and not recipients:
-            # Essayer le format multi (recipients_0_email, recipients_1_email, ...)
-            recipients = self._parse_multi_recipients(payload)
-
-        if not steps_config and not recipients:
-            # Format plat : un seul signataire (recipient_email, ...)
-            recipient_email = self._get_param(payload, 'recipient_email')
-            if recipient_email:
-                recipients = [{
-                    'email': recipient_email,
-                    'firstName': self._get_param(payload, 'recipient_firstname', ''),
-                    'lastName': self._get_param(payload, 'recipient_lastname', ''),
-                    'phone': self._get_param(payload, 'recipient_phone', ''),
-                }]
-
-        if not steps_config and not recipients:
-            raise GoodflagValidationError(
-                "'steps' or 'recipients' is required"
-            )
-
-        steps = self._build_steps(
-            recipients=recipients or [],
-            steps_config=steps_config,
-        )
-
-        # Métadonnées Publik -> champs data1-data16 Goodflag
-        metadata = payload.get('metadata', {})
-        external_ref = self._get_param(payload, 'external_ref', '')
-
-        # Layout pour les métadonnées
-        layout_id = self._get_param(payload, 'layout_id') or self.default_layout_id
-
-        # Mode du workflow
-        workflow_mode = self._get_param(payload, 'workflow_mode', 'FULL')
-
-        # Co-managers
-        allowed_comanager_users = payload.get('allowed_comanager_users')
-        comanager_notified_events = payload.get('comanager_notified_events')
-
-        if not self.user_id:
-            raise GoodflagValidationError(
-                "Configuration error: 'user_id' is missing in the connector settings."
-            )
-
-        client = self._get_client()
-        result = client.create_workflow(
-            user_id=self.user_id,
-            name=name,
-            steps=steps,
-            description=payload.get('description', ''),
-            workflow_mode=workflow_mode,
-            notified_events=payload.get('notified_events'),
-            watchers=payload.get('watchers'),
-            template_id=payload.get('template_id'),
-            allow_consolidation=payload.get('allow_consolidation'),
-            layout_id=layout_id,
-            metadata=metadata,
-            external_ref=external_ref,
-            allowed_comanager_users=allowed_comanager_users,
-            comanager_notified_events=comanager_notified_events,
-        )
-
-        workflow_id = result.get('workflow_id')
-        if not workflow_id:
-            raise GoodflagError(
-                "Goodflag API failed to return a workflow ID."
-            )
-
-        # Persistance locale
-        GoodflagWorkflowTrace.objects.update_or_create(
-            resource=self,
-            goodflag_workflow_id=workflow_id,
-            defaults={
-                'external_ref': external_ref,
-                'workflow_name': name,
-                'status': result.get('status', 'draft'),
-                'metadata_json': json.dumps(metadata),
-            },
-        )
-
-        # Ne retourner que les champs essentiels (sans 'raw') pour éviter
-        # que WCS ait à analyser une réponse trop volumineuse qui peut
-        # empêcher la propagation correcte de goodflag_create_data_workflow_id.
+        workflow_id, status, _ = self._prepare_and_create_workflow(payload)
         return {'data': {
             'workflow_id': workflow_id,
-            'status': result.get('status', 'draft'),
+            'status': status,
         }}
 
     @endpoint(
@@ -854,69 +850,7 @@ class GoodflagResource(BaseResource):
         payload = self._parse_payload(request, **kwargs)
 
         # -- Étape 1 : Créer le workflow --
-        name = self._get_param(payload, 'name')
-        if not name:
-            raise GoodflagValidationError("'name' is required")
-
-        steps_config = payload.get('steps')
-        recipients = payload.get('recipients')
-        if not steps_config and not recipients:
-            recipients = self._parse_multi_recipients(payload)
-        if not steps_config and not recipients:
-            recipient_email = self._get_param(payload, 'recipient_email')
-            if recipient_email:
-                recipients = [{
-                    'email': recipient_email,
-                    'firstName': self._get_param(payload, 'recipient_firstname', ''),
-                    'lastName': self._get_param(payload, 'recipient_lastname', ''),
-                    'phone': self._get_param(payload, 'recipient_phone', ''),
-                }]
-        if not steps_config and not recipients:
-            raise GoodflagValidationError("'steps' or 'recipients' is required")
-
-        steps = self._build_steps(recipients=recipients or [], steps_config=steps_config)
-        metadata = payload.get('metadata', {})
-        external_ref = self._get_param(payload, 'external_ref', '')
-        layout_id = self._get_param(payload, 'layout_id') or self.default_layout_id
-        workflow_mode = self._get_param(payload, 'workflow_mode', 'FULL')
-
-        if not self.user_id:
-            raise GoodflagValidationError(
-                "Configuration error: 'user_id' is missing in the connector settings."
-            )
-
-        client = self._get_client()
-        create_result = client.create_workflow(
-            user_id=self.user_id,
-            name=name,
-            steps=steps,
-            description=payload.get('description', ''),
-            workflow_mode=workflow_mode,
-            notified_events=payload.get('notified_events'),
-            watchers=payload.get('watchers'),
-            template_id=payload.get('template_id'),
-            allow_consolidation=payload.get('allow_consolidation'),
-            layout_id=layout_id,
-            metadata=metadata,
-            external_ref=external_ref,
-            allowed_comanager_users=payload.get('allowed_comanager_users'),
-            comanager_notified_events=payload.get('comanager_notified_events'),
-        )
-
-        workflow_id = create_result.get('workflow_id')
-        if not workflow_id:
-            raise GoodflagError("Goodflag API failed to return a workflow ID.")
-
-        GoodflagWorkflowTrace.objects.update_or_create(
-            resource=self,
-            goodflag_workflow_id=workflow_id,
-            defaults={
-                'external_ref': external_ref,
-                'workflow_name': name,
-                'status': create_result.get('status', 'draft'),
-                'metadata_json': json.dumps(metadata),
-            },
-        )
+        workflow_id, _, client = self._prepare_and_create_workflow(payload)
 
         # -- Étape 2 : Upload du document --
         # En cas d'échec ici ou à l'étape 3, la trace reste en statut 'draft'

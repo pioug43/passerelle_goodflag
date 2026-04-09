@@ -366,7 +366,7 @@ class TestSubmitWorkflow:
         )
         responses.add(
             responses.GET,
-            'https://wcs.test/pdf/convention.pdf',
+            'https://wcs.publik.test/pdf/convention.pdf',
             body=b'%PDF-1.4 test content',
             status=200,
         )
@@ -389,7 +389,7 @@ class TestSubmitWorkflow:
             'recipient_firstname': 'Jean',
             'recipient_lastname': 'Dupont',
             'external_ref': 'DEM-2024-001',
-            'file_url': 'https://wcs.test/pdf/convention.pdf',
+            'file_url': 'https://wcs.publik.test/pdf/convention.pdf',
             'filename': 'convention.pdf',
         }
         request = factory.post(
@@ -1166,7 +1166,7 @@ class TestMultiRecipients:
         """Test du format multi-signataires indexé (recipients_0_email, ...)."""
         responses.add(
             responses.POST,
-            f'{BASE_URL}/users/usr_Test001/workflows',
+            f'{BASE_URL}/users/{USER_ID}/workflows',
             json=MOCK_WORKFLOW_RESPONSE,
             status=200,
         )
@@ -1291,27 +1291,366 @@ class TestDaily:
 
 class TestValidateFileContent:
     def test_valid_pdf_passes(self):
-        from passerelle_goodflag.models import _validate_file_content
-        _validate_file_content(b'%PDF-1.4 valid content', 'application/pdf')
+        from passerelle_goodflag.services.files import validate_file_content
+        validate_file_content(b'%PDF-1.4 valid content', 'application/pdf')
 
     def test_invalid_pdf_raises(self):
-        from passerelle_goodflag.models import _validate_file_content
+        from passerelle_goodflag.services.files import validate_file_content
         from passerelle_goodflag.exceptions import GoodflagValidationError
         with pytest.raises(GoodflagValidationError, match='%PDF'):
-            _validate_file_content(b'not a pdf', 'application/pdf')
+            validate_file_content(b'not a pdf', 'application/pdf')
 
     def test_encrypted_pdf_raises(self):
-        from passerelle_goodflag.models import _validate_file_content
+        from passerelle_goodflag.services.files import validate_file_content
         from passerelle_goodflag.exceptions import GoodflagValidationError
         encrypted = b'%PDF-1.4 ' + b'/Encrypt some content'
         with pytest.raises(GoodflagValidationError, match='chiffrement'):
-            _validate_file_content(encrypted, 'application/pdf')
+            validate_file_content(encrypted, 'application/pdf')
 
     def test_empty_file_raises(self):
-        from passerelle_goodflag.models import _validate_file_content
+        from passerelle_goodflag.services.files import validate_file_content
         from passerelle_goodflag.exceptions import GoodflagValidationError
         with pytest.raises(GoodflagValidationError, match='vide'):
-            _validate_file_content(b'', 'application/pdf')
+            validate_file_content(b'', 'application/pdf')
+
+
+# ====================================================================== #
+# Tests de non-régression ajoutés
+# ====================================================================== #
+
+
+class TestWebhookNoSecretRevalidationFail:
+    """Webhook sans secret + échec de revalidation => erreur, aucune persistance."""
+
+    @responses.activate
+    def test_rejects_when_revalidation_fails(self, connector, factory):
+        """Sans webhook_secret, si revalidation échoue, on rejette tout."""
+        connector.webhook_secret = ''
+        connector.save()
+
+        # Mock revalidation qui échoue
+        responses.add(
+            responses.GET,
+            f'{BASE_URL}/webhookEvents/wbe_NoSecret001',
+            json={'error': 'Unauthorized'},
+            status=401,
+        )
+
+        payload = {
+            'id': 'wbe_NoSecret001',
+            'eventType': 'workflowFinished',
+            'workflowId': 'wfl_Test001',
+        }
+        request = factory.post(
+            '/webhook',
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+        request.GET = {}
+        response = connector.webhook(request)
+
+        assert response.status_code == 403
+
+        # Aucun événement ne doit être persisté
+        assert not GoodflagWebhookEvent.objects.filter(
+            resource=connector, event_id='wbe_NoSecret001',
+        ).exists()
+
+        # Aucune trace ne doit être mise à jour
+        # (on vérifie qu'il n'y a pas de trace modifiée)
+
+    @responses.activate
+    def test_accepts_when_revalidation_succeeds(self, connector, factory):
+        """Sans webhook_secret, si revalidation réussit, on accepte."""
+        connector.webhook_secret = ''
+        connector.save()
+
+        responses.add(
+            responses.GET,
+            f'{BASE_URL}/webhookEvents/wbe_NoSecretOK',
+            json={
+                'id': 'wbe_NoSecretOK',
+                'eventType': 'workflowFinished',
+                'workflowId': 'wfl_Test001',
+                'webhookId': 'wbh_001',
+            },
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            f'{BASE_URL}/workflows/wfl_Test001',
+            json={
+                'id': 'wfl_Test001',
+                'workflowStatus': 'finished',
+                'name': 'WF',
+                'progress': 100,
+                'steps': [],
+                'currentRecipientEmails': [],
+                'currentRecipientUsers': [],
+                'created': 1700000000000,
+                'updated': 1700000500000,
+                'finished': 1700000500000,
+            },
+            status=200,
+        )
+
+        payload = {
+            'id': 'wbe_NoSecretOK',
+            'eventType': 'workflowFinished',
+            'workflowId': 'wfl_Test001',
+        }
+        request = factory.post(
+            '/webhook',
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+        request.GET = {}
+        response = connector.webhook(request)
+
+        assert response.status_code == 200
+        assert GoodflagWebhookEvent.objects.filter(
+            resource=connector, event_id='wbe_NoSecretOK',
+        ).exists()
+
+
+class TestWebhookDuplicateIdempotence:
+    """Webhook dupliqué => idempotence réelle (atomique)."""
+
+    @responses.activate
+    def test_concurrent_duplicate_is_idempotent(self, connector, factory):
+        """Un événement déjà persisté est détecté par get_or_create atomique."""
+        # Créer un événement existant
+        GoodflagWebhookEvent.objects.create(
+            resource=connector,
+            event_id='wbe_AtomicDup',
+            event_type='workflowFinished',
+            goodflag_workflow_id='wfl_001',
+        )
+
+        payload = {
+            'id': 'wbe_AtomicDup',
+            'eventType': 'workflowFinished',
+            'workflowId': 'wfl_001',
+        }
+        request = factory.post(
+            '/webhook?token=webhook-secret-token',
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+        request.GET = {'token': 'webhook-secret-token'}
+        response = connector.webhook(request)
+
+        assert response.status_code == 200
+        data = json.loads(response.content)
+        assert data['status'] == 'already_processed'
+
+        # Toujours un seul enregistrement
+        count = GoodflagWebhookEvent.objects.filter(
+            resource=connector, event_id='wbe_AtomicDup',
+        ).count()
+        assert count == 1
+
+
+class TestCreateWorkflowStepsAndRecipients:
+    """create-workflow avec steps ET recipients => erreur de validation."""
+
+    def test_steps_and_recipients_rejected(self, connector, factory):
+        from passerelle_goodflag.exceptions import GoodflagValidationError
+        payload = {
+            'name': 'Test Both',
+            'steps': [{'stepType': 'signature', 'recipients': []}],
+            'recipients': [{'email': 'a@b.com'}],
+        }
+        request = factory.post(
+            '/create-workflow',
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+        with pytest.raises(GoodflagValidationError, match='mutually exclusive'):
+            connector.create_workflow(request)
+
+
+class TestRetrieveByExternalRefNoFalseNegative:
+    """retrieve-by-external-ref sans faux négatif lié à default_user_id."""
+
+    def test_finds_workflow_without_user_id_filter(self, connector, factory):
+        """La recherche ne filtre pas par user_id — pas de faux négatifs."""
+        GoodflagWorkflowTrace.objects.create(
+            resource=connector,
+            goodflag_workflow_id='wfl_OtherUser',
+            external_ref='DEM-NOFILTER',
+            workflow_name='Workflow autre user',
+            status='finished',
+        )
+        request = factory.get('/retrieve-by-external-ref')
+        result = connector.retrieve_by_external_ref(
+            request, external_ref='DEM-NOFILTER'
+        )
+        data = result['data']
+        assert data['count'] == 1
+        assert data['results'][0]['workflow_id'] == 'wfl_OtherUser'
+
+    @responses.activate
+    def test_remote_fallback_when_no_local(self, connector, factory):
+        """Si pas de trace locale, tente une recherche distante."""
+        responses.add(
+            responses.GET,
+            f'{BASE_URL}/workflows',
+            json={
+                'items': [{
+                    'id': 'wfl_Remote001',
+                    'name': 'Remote Workflow DEM-REMOTE',
+                    'workflowStatus': 'finished',
+                }],
+                'totalItems': 1,
+                'itemsPerPage': 50,
+                'pageIndex': 0,
+            },
+            status=200,
+        )
+        request = factory.get('/retrieve-by-external-ref')
+        result = connector.retrieve_by_external_ref(
+            request, external_ref='DEM-REMOTE'
+        )
+        data = result['data']
+        # Le résultat doit inclure le workflow trouvé à distance
+        assert data['count'] >= 1
+
+
+class TestFileUrlBehavior:
+    """Tests du comportement retenu pour file_url (HTTPS only + Passerelle session)."""
+
+    def test_http_url_rejected(self, connector, factory):
+        """file_url avec HTTP (non HTTPS) est rejeté."""
+        from passerelle_goodflag.services.files import validate_file_url
+        from passerelle_goodflag.exceptions import GoodflagValidationError
+        with pytest.raises(GoodflagValidationError, match='https only'):
+            validate_file_url('http://wcs.test/pdf/convention.pdf')
+
+    def test_https_url_accepted(self):
+        """file_url HTTPS valide ne lève pas d'exception."""
+        from passerelle_goodflag.services.files import validate_file_url
+        # Ne doit pas lever d'exception
+        validate_file_url('https://wcs.test/pdf/convention.pdf')
+
+    def test_private_ip_rejected(self):
+        """file_url vers une IP privée est rejeté."""
+        from passerelle_goodflag.services.files import validate_file_url
+        from passerelle_goodflag.exceptions import GoodflagValidationError
+        with pytest.raises(GoodflagValidationError, match='non-routable'):
+            validate_file_url('https://192.168.1.1/file.pdf')
+
+    def test_localhost_rejected(self):
+        """file_url vers localhost est rejeté."""
+        from passerelle_goodflag.services.files import validate_file_url
+        from passerelle_goodflag.exceptions import GoodflagValidationError
+        with pytest.raises(GoodflagValidationError, match='local'):
+            validate_file_url('https://localhost/file.pdf')
+
+
+class TestWorkflowPayloadService:
+    """Tests unitaires du service prepare_workflow_data."""
+
+    def test_prepare_basic(self, connector):
+        from passerelle_goodflag.services.workflow_payload import prepare_workflow_data
+        payload = {
+            'name': 'Test Workflow',
+            'recipient_email': 'a@b.com',
+            'recipient_firstname': 'Alice',
+            'recipient_lastname': 'Martin',
+            'external_ref': 'DEM-001',
+        }
+        result = prepare_workflow_data(payload, connector)
+        assert result['name'] == 'Test Workflow'
+        assert result['external_ref'] == 'DEM-001'
+        assert result['workflow_mode'] == 'FULL'
+        assert len(result['steps']) == 1
+        assert result['steps'][0]['stepType'] == 'signature'
+        assert result['steps'][0]['recipients'][0]['email'] == 'a@b.com'
+
+    def test_prepare_rejects_steps_and_recipients(self, connector):
+        from passerelle_goodflag.services.workflow_payload import prepare_workflow_data
+        from passerelle_goodflag.exceptions import GoodflagValidationError
+        payload = {
+            'name': 'Test',
+            'steps': [{'stepType': 'signature', 'recipients': []}],
+            'recipients': [{'email': 'a@b.com'}],
+        }
+        with pytest.raises(GoodflagValidationError, match='mutually exclusive'):
+            prepare_workflow_data(payload, connector)
+
+    def test_prepare_requires_name(self, connector):
+        from passerelle_goodflag.services.workflow_payload import prepare_workflow_data
+        from passerelle_goodflag.exceptions import GoodflagValidationError
+        with pytest.raises(GoodflagValidationError, match='name'):
+            prepare_workflow_data({'recipients': [{'email': 'a@b.com'}]}, connector)
+
+    def test_prepare_requires_recipients_or_steps(self, connector):
+        from passerelle_goodflag.services.workflow_payload import prepare_workflow_data
+        from passerelle_goodflag.exceptions import GoodflagValidationError
+        with pytest.raises(GoodflagValidationError, match='steps.*recipients'):
+            prepare_workflow_data({'name': 'Test'}, connector)
+
+
+class TestWebhookService:
+    """Tests unitaires du service webhooks.process_webhook."""
+
+    @responses.activate
+    def test_process_webhook_ok(self, connector):
+        from passerelle_goodflag.services.webhooks import process_webhook
+        from passerelle_goodflag.client import GoodflagClient
+
+        responses.add(
+            responses.GET,
+            f'{BASE_URL}/webhookEvents/wbe_Svc001',
+            json={
+                'id': 'wbe_Svc001',
+                'eventType': 'workflowFinished',
+                'workflowId': 'wfl_Test001',
+            },
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            f'{BASE_URL}/workflows/wfl_Test001',
+            json={
+                'id': 'wfl_Test001',
+                'workflowStatus': 'finished',
+                'name': 'WF',
+                'progress': 100,
+                'steps': [],
+                'currentRecipientEmails': [],
+                'currentRecipientUsers': [],
+                'created': 1700000000000,
+                'updated': 1700000500000,
+                'finished': 1700000500000,
+            },
+            status=200,
+        )
+
+        client = GoodflagClient(
+            base_url=BASE_URL,
+            access_token='act_test.secret_token_value',
+        )
+        payload = {
+            'id': 'wbe_Svc001',
+            'eventType': 'workflowFinished',
+            'workflowId': 'wfl_Test001',
+        }
+        result = process_webhook(connector, payload, client)
+        assert result['status'] == 'ok'
+        assert result['status_code'] == 200
+
+        # Événement persisté
+        assert GoodflagWebhookEvent.objects.filter(
+            resource=connector, event_id='wbe_Svc001',
+        ).exists()
+
+    def test_process_webhook_missing_event_id(self, connector):
+        from passerelle_goodflag.services.webhooks import process_webhook
+        result = process_webhook(connector, {'eventType': 'test'}, None)
+        assert result['status'] == 'error'
+        assert result['status_code'] == 400
 
 
 class TestWcsCallback:

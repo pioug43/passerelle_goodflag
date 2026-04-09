@@ -7,7 +7,7 @@ with open(os.path.join(os.path.dirname(__file__), 'README.md'), encoding='utf-8'
 
 setup(
     name='passerelle-goodflag',
-    version='1.3.0',
+    version='1.4.0',
     description='Connecteur Passerelle pour la signature électronique Goodflag',
     long_description=long_description,
     long_description_content_type='text/markdown',

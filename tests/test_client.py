@@ -563,3 +563,95 @@ class TestDownloadEvidenceCertificateClient:
         assert result['content'] == b'%PDF-1.4 evidence'
         assert result['filename'] == 'evidence.pdf'
         assert result['content_type'] == 'application/pdf'
+
+
+class TestRaiseForStatusNonDict:
+    """Vérifie que _raise_for_status gère les réponses JSON non-dict."""
+
+    @responses.activate
+    def test_string_json_response(self, client):
+        """Une réponse JSON qui est une string ne doit pas lever AttributeError."""
+        responses.add(
+            responses.GET,
+            f'{BASE_URL}/workflows/wfl_bad',
+            json='Some error string',
+            status=500,
+        )
+        from passerelle_goodflag.exceptions import GoodflagError
+        with pytest.raises(GoodflagError) as exc_info:
+            client.get_workflow('wfl_bad')
+        assert 'Some error string' in str(exc_info.value)
+
+    @responses.activate
+    def test_list_json_response(self, client):
+        """Une réponse JSON qui est une liste ne doit pas lever AttributeError."""
+        responses.add(
+            responses.GET,
+            f'{BASE_URL}/workflows/wfl_bad',
+            json=['error1', 'error2'],
+            status=400,
+        )
+        with pytest.raises(GoodflagValidationError):
+            client.get_workflow('wfl_bad')
+
+    @responses.activate
+    def test_number_json_response(self, client):
+        """Une réponse JSON qui est un nombre ne doit pas lever AttributeError."""
+        responses.add(
+            responses.GET,
+            f'{BASE_URL}/workflows/wfl_bad',
+            json=42,
+            status=404,
+        )
+        from passerelle_goodflag.exceptions import GoodflagNotFoundError
+        with pytest.raises(GoodflagNotFoundError):
+            client.get_workflow('wfl_bad')
+
+
+class TestDataFieldsValidation:
+    """Vérifie que les metadata n'acceptent que data1-data16."""
+
+    @responses.activate
+    def test_invalid_key_rejected(self, client):
+        """Une clé invalide dans metadata lève GoodflagValidationError."""
+        with pytest.raises(GoodflagValidationError, match='Invalid metadata keys'):
+            client.create_workflow(
+                user_id=USER_ID,
+                name='Test',
+                steps=[{'stepType': 'signature', 'recipients': []}],
+                metadata={'name': 'evil', 'data1': 'ok'},
+            )
+
+    @responses.activate
+    def test_valid_keys_accepted(self, client):
+        """Les clés data1-data16 sont acceptées."""
+        responses.add(
+            responses.POST,
+            f'{BASE_URL}/users/{USER_ID}/workflows',
+            json={'id': 'wfl_001', 'workflowStatus': 'draft'},
+            status=200,
+        )
+        result = client.create_workflow(
+            user_id=USER_ID,
+            name='Test',
+            steps=[{'stepType': 'signature', 'recipients': []}],
+            metadata={'data1': 'val1', 'data16': 'val16'},
+        )
+        assert result['workflow_id'] == 'wfl_001'
+
+        import json as json_mod
+        sent = responses.calls[0].request
+        body = json_mod.loads(sent.body)
+        assert body['data1'] == 'val1'
+        assert body['data16'] == 'val16'
+
+    @responses.activate
+    def test_toplevel_overwrite_blocked(self, client):
+        """Impossible d'écraser workflowMode via metadata."""
+        with pytest.raises(GoodflagValidationError, match='workflowMode'):
+            client.create_workflow(
+                user_id=USER_ID,
+                name='Test',
+                steps=[{'stepType': 'signature', 'recipients': []}],
+                metadata={'workflowMode': 'SINGLE_SIGNER', 'data1': 'ok'},
+            )

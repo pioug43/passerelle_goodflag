@@ -107,8 +107,8 @@ Exemple local : `https://passerelle.dev.publik.love/passerelle-goodflag/goodflag
 
 | Endpoint | Méthode | Description |
 |----------|---------|-------------|
-| `create-workflow` | POST | Crée un workflow de signature (statut `draft`). Supporte 1 à N signataires. |
-| `upload-document` | POST | Upload un document (PDF/DOCX/Images) — corps binaire brut, validation avancée |
+| `create-workflow` | POST | Crée un workflow de signature (statut `draft`). Supporte 1 à N signataires. **`steps` et `recipients` sont mutuellement exclusifs.** |
+| `upload-document` | POST | Upload un document (PDF/DOCX/Images) — corps binaire brut, validation avancée. **`file_url` requiert HTTPS et utilise la session Passerelle signée.** |
 | `upload-documents` | POST | Upload plusieurs documents en une seule requête (multipart) |
 | `start-workflow` | POST | Démarre le workflow (envoie les invitations email) |
 | `sync-status` | GET | Retourne le statut normalisé pour W.C.S. (avec cache configurable) |
@@ -125,7 +125,7 @@ Exemple local : `https://passerelle.dev.publik.love/passerelle-goodflag/goodflag
 | `create-invite` | POST | Génère une URL d'invitation pour un destinataire |
 | `resend-invite` | POST | Ré-envoie l'invitation par email à un signataire |
 | `get-viewer-url` | POST/GET | Génère une URL de viewer pour un document |
-| `retrieve-by-external-ref` | GET | Retrouve un workflow par référence Publik |
+| `retrieve-by-external-ref` | GET | Retrouve un workflow par référence Publik (recherche locale + fallback API distante) |
 | `list-workflows` | GET | Liste et recherche les workflows (filtres statut, texte, pagination) |
 
 ### Supervision
@@ -189,9 +189,13 @@ Les index commencent à 0 et sont consécutifs. Chaque signataire peut aussi avo
 
 En JSON, on peut aussi envoyer `recipients` (liste) ou `steps` (format natif Goodflag) pour les cas multi-signataires ou multi-étapes (approbation + signature).
 
+> **Important** : `steps` et `recipients` sont **mutuellement exclusifs**. Si les deux sont fournis, le connecteur retourne une erreur de validation. Utiliser `steps` pour le format natif Goodflag (approbation + signature), ou `recipients` pour le format simplifié.
+
 ### Envoi direct du document (Recommandé)
 
 Si le serveur Passerelle ne peut pas accéder aux documents via une URL (pare-feu, authentification), vous pouvez envoyer le contenu du document directement dans la requête `upload-document`.
+
+> **Sécurité `file_url`** : le paramètre `file_url` est restreint au protocole **HTTPS uniquement**. Le fichier est récupéré via la session Passerelle signée (`self.requests`), qui assure l'authentification inter-composants Publik. Les adresses IP privées, loopback et locales sont rejetées (protection SSRF).
 
 **Format JSON imbriqué (Publik) :**
 ```json
@@ -295,7 +299,9 @@ Goodflag ne signe pas ses webhooks (pas de HMAC). Le connecteur compense par :
 
 1. **Token secret** dans l'URL du webhook (`webhook_secret`)
 2. **Re-validation** de chaque événement via `GET /api/webhookEvents/{id}`
-3. **Anti-rejeu** par `event_id` unique en base de données
+3. **Anti-rejeu** par `event_id` unique en base de données (contrainte `unique_together`)
+
+> **Important** : si `webhook_secret` est vide, la re-validation API est **obligatoire**. Si elle échoue, l'événement est rejeté, aucune donnée n'est persistée et aucune trace n'est mise à jour. Ceci garantit qu'un webhook non vérifiable ne peut pas modifier l'état du connecteur.
 
 ## Fonctionnalités Passerelle intégrées
 
@@ -334,8 +340,10 @@ détaillée de chaque appel API (contenu des requêtes et réponses).
 
 ## Métadonnées Goodflag
 
-Les métadonnées Goodflag utilisent les champs `data1` à `data16`. Avant de
-les utiliser :
+Les métadonnées Goodflag utilisent **exclusivement** les champs `data1` à `data16`.
+Toute autre clé dans le paramètre `metadata` provoque une erreur de validation
+(protection contre l'écrasement de champs top-level comme `name`, `workflowMode`, `steps`).
+Avant de les utiliser :
 
 1. Configurer le mapping au niveau du tenant (`PUT /api/tenants/{tenantId}/dataMapping`)
 2. Créer un layout qui référence les métadonnées
@@ -370,6 +378,12 @@ passerelle-goodflag/
 │   ├── exceptions.py          # GoodflagError, GoodflagAuthError, GoodflagValidationError, ...
 │   ├── client.py              # Client HTTP isolé (testable sans Django)
 │   ├── models.py              # GoodflagResource (endpoints) + modèles de persistance
+│   ├── services/              # Logique métier extraite
+│   │   ├── workflow_payload.py  # Préparation données workflow (create/submit)
+│   │   ├── files.py             # Validation fichiers, SSRF, content-type
+│   │   ├── webhooks.py          # Traitement et persistance webhooks
+│   │   ├── retrieval.py         # Résolution workflow_id, recherche external_ref
+│   │   └── downloads.py         # Construction réponses HTTP de téléchargement
 │   └── migrations/            # Générées localement par makemigrations
 ├── tests/
 │   ├── conftest.py            # Fixtures : connector, factory, mocks API
@@ -391,8 +405,9 @@ passerelle-goodflag/
 | Module | Responsabilité |
 |--------|---------------|
 | `client.py` | Appels HTTP vers l'API Goodflag, authentification Bearer, gestion erreurs, **retry automatique** (3 tentatives sur erreurs 5xx), mapping statuts |
-| `models.py` | Endpoints Passerelle (`@endpoint`), parsing des requêtes (JSON + form-encoded), persistance locale, webhook, `check_status`, `hourly` |
+| `models.py` | Endpoints Passerelle (`@endpoint`), parsing des requêtes, persistance locale, `check_status`, `hourly` — délègue la logique métier aux services |
 | `exceptions.py` | Hiérarchie d'exceptions métier (`GoodflagError` → `Auth`, `NotFound`, `Validation`, `Timeout`, `Upload`) |
+| `services/` | Logique métier extraite : préparation workflow, fichiers, webhooks, recherche, téléchargements |
 
 ### Modèles de persistance
 

@@ -235,6 +235,10 @@ class GoodflagClient:
         except ValueError:
             error_data = {'raw': response.text[:500]}
 
+        # Normaliser en dict : l'API peut retourner une string, une liste, etc.
+        if not isinstance(error_data, dict):
+            error_data = {'raw': str(error_data)[:500]}
+
         error_msg = (
             error_data.get('message')
             or error_data.get('error')
@@ -396,13 +400,19 @@ class GoodflagClient:
         if comanager_notified_events:
             payload['coManagerNotifiedEvents'] = comanager_notified_events
 
-        # Métadonnées Goodflag : champs data1-data16
+        # Métadonnées Goodflag : seuls les champs data1-data16 sont autorisés.
+        # Toute autre clé est rejetée pour empêcher l'écrasement de champs
+        # top-level du workflow (name, workflowMode, steps, etc.).
+        _VALID_DATA_KEYS = frozenset(f'data{i}' for i in range(1, MAX_METADATA_SLOTS + 1))
         if metadata and isinstance(metadata, dict):
+            invalid_keys = set(metadata.keys()) - _VALID_DATA_KEYS
+            if invalid_keys:
+                raise GoodflagValidationError(
+                    f"Invalid metadata keys: {', '.join(sorted(invalid_keys))}. "
+                    f"Only data1 to data{MAX_METADATA_SLOTS} are allowed."
+                )
             for key, value in metadata.items():
-                if key.startswith('data') and key[4:].isdigit():
-                    slot_num = int(key[4:])
-                    if 1 <= slot_num <= MAX_METADATA_SLOTS:
-                        payload[key] = str(value)
+                payload[key] = str(value)
 
         logger.info(
             "Creating Goodflag workflow: name=%s, user_id=%s, external_ref=%s",

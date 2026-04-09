@@ -9,37 +9,35 @@ GoodflagDocumentTrace : métadonnées des documents uploadés / signés
 
 import base64
 import hmac
-import io
-import ipaddress
 import json
 import logging
-import time
-import zipfile
-from urllib.parse import urlparse
 
 from django.core.cache import cache
 from django.db import models
-from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
+from django.http import JsonResponse
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from passerelle.base.models import BaseResource
 from passerelle.utils.api import endpoint
 
-from .client import GoodflagClient, _sanitize_for_log
+from .client import GoodflagClient
 from .exceptions import (
     GoodflagError,
     GoodflagRateLimitError,
     GoodflagValidationError,
 )
+from .services.downloads import build_download_response
+from .services.files import MAX_B64_LEN, parse_file_from_payload, sniff_content_type, validate_file_content
+from .services.retrieval import resolve_workflow_id as _svc_resolve_workflow_id
+from .services.retrieval import retrieve_by_external_ref as _svc_retrieve_by_external_ref
+from .services.webhooks import process_webhook
+from .services.workflow_payload import get_param as _svc_get_param, prepare_workflow_data
 
 logger = logging.getLogger(__name__)
 
 # Statuts finaux d'un workflow Goodflag (utilisés dans hourly, sync_status, webhook)
 _FINAL_STATUSES = frozenset({'finished', 'refused'})
-
-# Taille max d'un fichier encodé en base64 (~50 Mo décodé)
-_MAX_B64_LEN = int(50 * 1024 * 1024 * 4 / 3) + 1024
 
 # Clés PII à masquer dans les logs debug
 _PII_KEYS = frozenset({
@@ -48,124 +46,6 @@ _PII_KEYS = frozenset({
     'phoneNumber', 'phone', 'file', 'file_base64', 'file_url',
     'content',
 })
-
-
-def _sniff_content_type(content, declared_type):
-    """
-    Détecte le type MIME réel d'un fichier par ses magic bytes.
-
-    WCS renvoie souvent Content-Type: text/html ou application/octet-stream
-    même pour des PDFs valides. On se base sur le contenu réel.
-    """
-    if content[:4] == b'%PDF':
-        return 'application/pdf'
-    if content[:4] == b'PK\x03\x04':
-        return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    if content[:3] in (b'\xff\xd8\xff',):
-        return 'image/jpeg'
-    if content[:8] == b'\x89PNG\r\n\x1a\n':
-        return 'image/png'
-    # Aucun magic byte reconnu : garder le type déclaré
-    return declared_type
-
-
-def _validate_file_url(url):
-    """
-    Valide qu'une URL de fichier ne pointe pas vers une ressource interne
-    (protection contre les attaques SSRF).
-
-    Rejette :
-    - Schémas non-HTTP (file://, ftp://, gopher://, etc.)
-    - Adresses IP privées / loopback / link-local / réservées
-    - Hostname résolu vers une adresse privée (non vérifié ici — résolution DNS
-      hors scope, mais le schéma et la forme littérale sont contrôlés)
-
-    Lève GoodflagValidationError si l'URL est suspecte.
-    """
-    if not url:
-        raise GoodflagValidationError("file_url is required")
-    parsed = urlparse(url)
-    if parsed.scheme not in ('http', 'https'):
-        raise GoodflagValidationError(
-            f"file_url scheme '{parsed.scheme}' not allowed (http/https only)"
-        )
-    hostname = parsed.hostname or ''
-    # Rejeter les IP littérales privées / réservées
-    try:
-        addr = ipaddress.ip_address(hostname)
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast):
-            raise GoodflagValidationError(
-                f"file_url points to a non-routable address: {hostname}"
-            )
-    except ValueError:
-        # Nom de domaine — on accepte, la résolution DNS n'est pas contrôlée ici
-        pass
-    # Rejeter les hostnames clairement locaux
-    local_patterns = ('localhost', '127.', '0.0.0.0', '::1', 'metadata.google',
-                      '169.254.', 'metadata.internal')
-    for pat in local_patterns:
-        if hostname.lower().startswith(pat) or hostname.lower() == pat.rstrip('.'):
-            raise GoodflagValidationError(
-                f"file_url points to a local/internal address: {hostname}"
-            )
-
-
-def _validate_file_content(content, content_type):
-    """
-    Valide le contenu d'un fichier avant upload vers Goodflag.
-
-    Vérifie :
-    - PDF : signature magique, absence de chiffrement, non vide
-    - DOCX : signature ZIP (PK\\x03\\x04), fichier word/_rels/document.xml.rels présent
-    - Taille non nulle
-
-    Lève GoodflagValidationError si le fichier est invalide.
-    """
-    if not content:
-        raise GoodflagValidationError("Le fichier est vide")
-
-    # Détection du type réel par magic bytes, indépendamment du content_type déclaré.
-    # WCS peut servir un PDF avec Content-Type: application/octet-stream.
-    is_pdf_by_content = content.startswith(b'%PDF')
-    is_pdf_by_type = 'pdf' in content_type.lower()
-
-    if is_pdf_by_content or is_pdf_by_type:
-        # Si le type déclaré dit PDF mais que les bytes ne correspondent pas,
-        # c'est une erreur réelle (ex: HTML de login renvoyé à la place du fichier).
-        if is_pdf_by_type and not is_pdf_by_content:
-            raise GoodflagValidationError(
-                "Le fichier n'est pas un PDF valide (signature %PDF manquante). "
-                "Vérifiez que l'URL du document est accessible et retourne bien un PDF."
-            )
-        # Détection PDF chiffré : cherche /Encrypt dans les 2048 premiers octets
-        # ou dans les 512 derniers (où se trouve souvent le trailer)
-        probe = content[:2048] + content[-512:]
-        if b'/Encrypt' in probe:
-            raise GoodflagValidationError(
-                "Le PDF est protégé par chiffrement. "
-                "Goodflag ne peut pas signer un PDF chiffré. "
-                "Déchiffrez le document avant de l'uploader."
-            )
-
-    elif 'wordprocessingml' in content_type or 'docx' in content_type.lower():
-        # Vérification signature ZIP (DOCX = ZIP)
-        if not content.startswith(b'PK\x03\x04'):
-            raise GoodflagValidationError(
-                "Le fichier DOCX n'est pas valide (signature ZIP manquante)"
-            )
-        # Vérification structure interne DOCX minimale
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as zf:
-                names = zf.namelist()
-                if 'word/document.xml' not in names:
-                    raise GoodflagValidationError(
-                        "Le fichier DOCX est corrompu (word/document.xml manquant)"
-                    )
-        except zipfile.BadZipFile:
-            raise GoodflagValidationError(
-                "Le fichier DOCX est corrompu (archive ZIP invalide)"
-            )
 
 
 class GoodflagResource(BaseResource):
@@ -409,12 +289,7 @@ class GoodflagResource(BaseResource):
     @staticmethod
     def _get_param(payload, key, default=None):
         """Récupère un paramètre depuis un dict JSON ou form-encoded (liste)."""
-        val = payload.get(key, default)
-        if isinstance(val, list):
-            val = val[0] if val else default
-        if val == '' and default is not None:
-            return default
-        return val
+        return _svc_get_param(payload, key, default)
 
     def _get_client(self):
         """Retourne une instance du client Goodflag configurée."""
@@ -431,206 +306,18 @@ class GoodflagResource(BaseResource):
             logger.info("[GOODFLAG DEBUG] " + message, *args)
 
     def _resolve_workflow_id(self, payload):
-        """
-        Résout le workflow_id depuis le payload.
+        """Résout le workflow_id depuis le payload (direct ou via external_ref)."""
+        return _svc_resolve_workflow_id(self, payload)
 
-        Cherche d'abord workflow_id directement, puis utilise external_ref
-        comme fallback pour retrouver le workflow depuis la trace locale.
-        Cela permet de récupérer le workflow_id même si la variable WCS
-        goodflag_create_data_workflow_id n'a pas été correctement propagée.
-        """
-        workflow_id = self._get_param(payload, 'workflow_id')
-        if not workflow_id:
-            # Recherche de la référence externe dans plusieurs champs possibles (Publik)
-            external_ref = (
-                self._get_param(payload, 'external_ref')
-                or self._get_param(payload, 'display_id')  # ex: "12-1"
-                or self._get_param(payload, 'uuid')        # ex: "a02ca561-..."
-                # Note: 'id' retiré — trop générique, risque de collision
-            )
-            if external_ref:
-                trace = GoodflagWorkflowTrace.objects.filter(
-                    resource=self,
-                    external_ref=external_ref,
-                ).order_by('-created_at').first()
-                if trace:
-                    workflow_id = trace.goodflag_workflow_id
-                    logger.info(
-                        "Resolved workflow_id=%s from external_ref=%s",
-                        workflow_id, external_ref,
-                    )
-        return workflow_id
-
-    def _build_steps(self, recipients, steps_config=None):
-        """
-        Construit la structure steps[] pour l'API Goodflag.
-
-        Si steps_config est fourni, il est utilisé tel quel (format natif
-        Goodflag). Sinon, on construit une étape de signature unique
-        à partir de la liste de recipients.
-
-        Chaque destinataire doit avoir au minimum un consentPageId et un
-        email. Si consentPageId manque, la valeur par défaut du connecteur
-        est utilisée.
-        """
-        if steps_config:
-            # Format natif : on s'assure juste que consentPageId est présent
-            for step in steps_config:
-                for recipient in step.get('recipients', []):
-                    if not recipient.get('consentPageId') and self.default_consent_page_id:
-                        recipient['consentPageId'] = self.default_consent_page_id
-            return steps_config
-
-        # Construction simplifiée : une seule étape de type signature
-        built_recipients = []
-        for r in recipients:
-            recipient = dict(r)
-            if not recipient.get('consentPageId') and self.default_consent_page_id:
-                recipient['consentPageId'] = self.default_consent_page_id
-            # On supprime si c'est vide pour éviter erreur 400
-            if 'consentPageId' in recipient and not recipient['consentPageId']:
-                del recipient['consentPageId']
-            
-            # Mapping phone (Publik) -> phoneNumber (Goodflag)
-            phone = recipient.pop('phone', None)
-            if phone:
-                recipient['phoneNumber'] = phone
-            
-            built_recipients.append(recipient)
-
-        steps = [{
-            'stepType': 'signature',
-            'recipients': built_recipients,
-            'maxInvites': 5,
-        }]
-
-        if self.debug_mode:
-            logger.info("[GOODFLAG DEBUG] built steps: %r", steps)
-
-        return steps
-
-    def _parse_multi_recipients(self, payload):
-        """
-        Parse les destinataires au format form-encoded numéroté de W.C.S.
-
-        Supporte deux formats :
-        - Format indexé : recipients_0_email, recipients_0_firstname, ...,
-                          recipients_1_email, recipients_1_firstname, ...
-        - Format JSON  : recipients = [{"email": ..., "firstName": ...}, ...]
-
-        Retourne une liste de dicts recipients ou None si aucun trouvé.
-        """
-        # Format JSON (liste dans le payload)
-        recipients_raw = payload.get('recipients')
-        if recipients_raw and isinstance(recipients_raw, list):
-            return recipients_raw
-
-        # Format indexé (form-encoded W.C.S.)
-        _MAX_RECIPIENTS = 100
-        recipients = []
-        i = 0
-        while i < _MAX_RECIPIENTS:
-            email = self._get_param(payload, f'recipients_{i}_email')
-            if not email:
-                break
-            recipient = {
-                'email': email,
-                'firstName': self._get_param(payload, f'recipients_{i}_firstname', ''),
-                'lastName': self._get_param(payload, f'recipients_{i}_lastname', ''),
-                'phone': self._get_param(payload, f'recipients_{i}_phone', ''),
-            }
-            consent_page = self._get_param(payload, f'recipients_{i}_consent_page_id')
-            if consent_page:
-                recipient['consentPageId'] = consent_page
-            sig_profile = self._get_param(payload, f'recipients_{i}_signature_profile_id')
-            if sig_profile:
-                recipient['signatureProfileId'] = sig_profile
-            recipients.append(recipient)
-            i += 1
-
-        return recipients if recipients else None
-
-    # -- Parsing de fichier ------------------------------------------------
+    # _build_steps and _parse_multi_recipients are now in services.workflow_payload
 
     def _parse_file_from_payload(self, payload, request):
-        """
-        Extrait le contenu d'un fichier depuis le payload ou la requête.
-
-        Priorité :
-          1. ``file`` (dict JSON) : {"filename": "...", "content_type": "...", "content": "<base64>"}
-          2. ``request.FILES['file']`` — upload multipart Django
-          3. ``file_base64`` — chaîne base64 directe
-          4. ``file_url`` — URL téléchargée via la session Passerelle signée
-          5. ``fields`` — objet de formulaire WCS complet (premier champ avec 'content')
-
-        Retourne (file_content: bytes, filename: str, content_type: str).
-        Lève GoodflagValidationError si aucune source n'est trouvable.
-        """
-        file_obj = payload.get('file')
-        if isinstance(file_obj, str) and file_obj.startswith('{'):
-            try:
-                file_obj = json.loads(file_obj)
-            except (ValueError, TypeError):
-                pass
-
-        filename = self._get_param(payload, 'filename')
-        content_type = self._get_param(payload, 'content_type', 'application/pdf')
-        file_content = None
-        file_url = None
-
-        if isinstance(file_obj, dict):
-            file_b64 = file_obj.get('content')
-            if not file_b64:
-                raise GoodflagValidationError("'content' is missing in 'file' object")
-            if len(file_b64) > _MAX_B64_LEN:
-                raise GoodflagValidationError("File content exceeds maximum allowed size (50 MB)")
-            file_content = base64.b64decode(file_b64)
-            filename = filename or file_obj.get('filename')
-            content_type = file_obj.get('content_type') or content_type
-        elif request.FILES.get('file'):
-            f = request.FILES['file']
-            file_content = f.read()
-            filename = filename or f.name
-        elif self._get_param(payload, 'file_base64'):
-            file_b64 = self._get_param(payload, 'file_base64')
-            if len(file_b64) > _MAX_B64_LEN:
-                raise GoodflagValidationError("File content exceeds maximum allowed size (50 MB)")
-            file_content = base64.b64decode(file_b64)
-        elif self._get_param(payload, 'file_url'):
-            file_url = self._get_param(payload, 'file_url')
-            _validate_file_url(file_url)
-            resp = self.requests.get(file_url)
-            if resp.status_code != 200:
-                raise GoodflagError(
-                    f"Failed to fetch file from URL: HTTP {resp.status_code}"
-                )
-            file_content = resp.content
-            # Détection du type par magic bytes — prioritaire sur le Content-Type
-            # déclaré par WCS qui peut être text/html, application/octet-stream, etc.
-            # même pour un PDF valide.
-            content_type = _sniff_content_type(file_content, content_type)
-        elif isinstance(payload.get('fields'), dict):
-            for field_val in payload['fields'].values():
-                if isinstance(field_val, dict) and 'content' in field_val:
-                    file_content = base64.b64decode(field_val['content'])
-                    filename = filename or field_val.get('filename')
-                    content_type = field_val.get('content_type') or content_type
-                    break
-
-        if not file_content:
-            raise GoodflagValidationError(
-                "'file' object, 'file_base64', 'file_url' or valid 'fields' is required"
-            )
-
-        _validate_file_content(file_content, content_type)
-
-        if not filename and file_url:
-            from urllib.parse import urlparse, unquote
-            path = urlparse(file_url).path
-            filename = unquote(path.rstrip('/').rsplit('/', 1)[-1]) or ''
-        filename = filename or 'document.pdf'
-
-        return file_content, filename, content_type
+        """Extrait le contenu d'un fichier depuis le payload ou la requête."""
+        return parse_file_from_payload(
+            payload, request,
+            passerelle_session=self.requests,
+            get_param=lambda key, default=None: self._get_param(payload, key, default),
+        )
 
     # -- Notification WCS --------------------------------------------------
 
@@ -872,77 +559,24 @@ class GoodflagResource(BaseResource):
     )
     def create_workflow(self, request, **kwargs):
         payload = self._parse_payload(request, **kwargs)
-
-        name = self._get_param(payload, 'name')
-        if not name:
-            raise GoodflagValidationError("'name' is required")
-
-        # Soit on fournit des steps natifs Goodflag, soit des recipients
-        # simplifiés (JSON) ou des paramètres plats (form W.C.S.)
-        steps_config = payload.get('steps')
-        recipients = payload.get('recipients')
-
-        # Multi-signataires (format indexé ou JSON) ou signataire unique (format plat)
-        if not steps_config and not recipients:
-            # Essayer le format multi (recipients_0_email, recipients_1_email, ...)
-            recipients = self._parse_multi_recipients(payload)
-
-        if not steps_config and not recipients:
-            # Format plat : un seul signataire (recipient_email, ...)
-            recipient_email = self._get_param(payload, 'recipient_email')
-            if recipient_email:
-                recipients = [{
-                    'email': recipient_email,
-                    'firstName': self._get_param(payload, 'recipient_firstname', ''),
-                    'lastName': self._get_param(payload, 'recipient_lastname', ''),
-                    'phone': self._get_param(payload, 'recipient_phone', ''),
-                }]
-
-        if not steps_config and not recipients:
-            raise GoodflagValidationError(
-                "'steps' or 'recipients' is required"
-            )
-
-        steps = self._build_steps(
-            recipients=recipients or [],
-            steps_config=steps_config,
-        )
-
-        # Métadonnées Publik -> champs data1-data16 Goodflag
-        metadata = payload.get('metadata', {})
-        external_ref = self._get_param(payload, 'external_ref', '')
-
-        # Layout pour les métadonnées
-        layout_id = self._get_param(payload, 'layout_id') or self.default_layout_id
-
-        # Mode du workflow
-        workflow_mode = self._get_param(payload, 'workflow_mode', 'FULL')
-
-        # Co-managers
-        allowed_comanager_users = payload.get('allowed_comanager_users')
-        comanager_notified_events = payload.get('comanager_notified_events')
-
-        if not self.user_id:
-            raise GoodflagValidationError(
-                "Configuration error: 'user_id' is missing in the connector settings."
-            )
+        wf_data = prepare_workflow_data(payload, self)
 
         client = self._get_client()
         result = client.create_workflow(
             user_id=self.user_id,
-            name=name,
-            steps=steps,
-            description=payload.get('description', ''),
-            workflow_mode=workflow_mode,
-            notified_events=payload.get('notified_events'),
-            watchers=payload.get('watchers'),
-            template_id=payload.get('template_id'),
-            allow_consolidation=payload.get('allow_consolidation'),
-            layout_id=layout_id,
-            metadata=metadata,
-            external_ref=external_ref,
-            allowed_comanager_users=allowed_comanager_users,
-            comanager_notified_events=comanager_notified_events,
+            name=wf_data['name'],
+            steps=wf_data['steps'],
+            description=wf_data['description'],
+            workflow_mode=wf_data['workflow_mode'],
+            notified_events=wf_data['notified_events'],
+            watchers=wf_data['watchers'],
+            template_id=wf_data['template_id'],
+            allow_consolidation=wf_data['allow_consolidation'],
+            layout_id=wf_data['layout_id'],
+            metadata=wf_data['metadata'],
+            external_ref=wf_data['external_ref'],
+            allowed_comanager_users=wf_data['allowed_comanager_users'],
+            comanager_notified_events=wf_data['comanager_notified_events'],
         )
 
         workflow_id = result.get('workflow_id')
@@ -951,21 +585,17 @@ class GoodflagResource(BaseResource):
                 "Goodflag API failed to return a workflow ID."
             )
 
-        # Persistance locale
         GoodflagWorkflowTrace.objects.update_or_create(
             resource=self,
             goodflag_workflow_id=workflow_id,
             defaults={
-                'external_ref': external_ref,
-                'workflow_name': name,
+                'external_ref': wf_data['external_ref'],
+                'workflow_name': wf_data['name'],
                 'status': result.get('status', 'draft'),
-                'metadata_json': json.dumps(metadata),
+                'metadata_json': json.dumps(wf_data['metadata']),
             },
         )
 
-        # Ne retourner que les champs essentiels (sans 'raw') pour éviter
-        # que WCS ait à analyser une réponse trop volumineuse qui peut
-        # empêcher la propagation correcte de goodflag_create_data_workflow_id.
         return {'data': {
             'workflow_id': workflow_id,
             'status': result.get('status', 'draft'),
@@ -1097,55 +727,29 @@ class GoodflagResource(BaseResource):
         """
         payload = self._parse_payload(request, **kwargs)
 
-        # -- Étape 1 : Créer le workflow --
-        name = self._get_param(payload, 'name')
-        if not name:
-            raise GoodflagValidationError("'name' is required")
-
-        steps_config = payload.get('steps')
-        recipients = payload.get('recipients')
-        if not steps_config and not recipients:
-            recipients = self._parse_multi_recipients(payload)
-        if not steps_config and not recipients:
-            recipient_email = self._get_param(payload, 'recipient_email')
-            if recipient_email:
-                recipients = [{
-                    'email': recipient_email,
-                    'firstName': self._get_param(payload, 'recipient_firstname', ''),
-                    'lastName': self._get_param(payload, 'recipient_lastname', ''),
-                    'phone': self._get_param(payload, 'recipient_phone', ''),
-                }]
-        if not steps_config and not recipients:
-            raise GoodflagValidationError("'steps' or 'recipients' is required")
-
-        steps = self._build_steps(recipients=recipients or [], steps_config=steps_config)
-        metadata = payload.get('metadata', {})
-        external_ref = self._get_param(payload, 'external_ref', '')
-        layout_id = self._get_param(payload, 'layout_id') or self.default_layout_id
-        workflow_mode = self._get_param(payload, 'workflow_mode', 'FULL')
-
-        if not self.user_id:
-            raise GoodflagValidationError(
-                "Configuration error: 'user_id' is missing in the connector settings."
-            )
+        # -- Étape 1 : Créer le workflow (utilise la préparation partagée) --
+        wf_data = prepare_workflow_data(payload, self)
 
         client = self._get_client()
         create_result = client.create_workflow(
             user_id=self.user_id,
-            name=name,
-            steps=steps,
-            description=payload.get('description', ''),
-            workflow_mode=workflow_mode,
-            notified_events=payload.get('notified_events'),
-            watchers=payload.get('watchers'),
-            template_id=payload.get('template_id'),
-            allow_consolidation=payload.get('allow_consolidation'),
-            layout_id=layout_id,
-            metadata=metadata,
-            external_ref=external_ref,
-            allowed_comanager_users=payload.get('allowed_comanager_users'),
-            comanager_notified_events=payload.get('comanager_notified_events'),
+            name=wf_data['name'],
+            steps=wf_data['steps'],
+            description=wf_data['description'],
+            workflow_mode=wf_data['workflow_mode'],
+            notified_events=wf_data['notified_events'],
+            watchers=wf_data['watchers'],
+            template_id=wf_data['template_id'],
+            allow_consolidation=wf_data['allow_consolidation'],
+            layout_id=wf_data['layout_id'],
+            metadata=wf_data['metadata'],
+            external_ref=wf_data['external_ref'],
+            allowed_comanager_users=wf_data['allowed_comanager_users'],
+            comanager_notified_events=wf_data['comanager_notified_events'],
         )
+        metadata = wf_data['metadata']
+        external_ref = wf_data['external_ref']
+        name = wf_data['name']
 
         workflow_id = create_result.get('workflow_id')
         if not workflow_id:
@@ -1373,12 +977,12 @@ class GoodflagResource(BaseResource):
             if not content_b64:
                 continue
 
-            if len(content_b64) > _MAX_B64_LEN:
+            if len(content_b64) > MAX_B64_LEN:
                 raise GoodflagValidationError("File content exceeds maximum allowed size (50 MB)")
             file_content = base64.b64decode(content_b64)
             content_type = f.get('content_type', 'application/pdf')
-            content_type = _sniff_content_type(file_content, content_type)
-            _validate_file_content(file_content, content_type)
+            content_type = sniff_content_type(file_content, content_type)
+            validate_file_content(file_content, content_type)
 
             files_list.append({
                 'content': file_content,
@@ -1765,24 +1369,7 @@ class GoodflagResource(BaseResource):
             )
             raise
 
-        if 'response' in result:
-            streaming_response = StreamingHttpResponse(
-                result['response'].iter_content(chunk_size=8192),
-                content_type=result['content_type'],
-            )
-            streaming_response['Content-Disposition'] = (
-                f'attachment; filename="{result["filename"]}"'
-            )
-            return streaming_response
-
-        response = HttpResponse(
-            result.get('content', b''),
-            content_type=result['content_type'],
-        )
-        response['Content-Disposition'] = (
-            f'attachment; filename="{result["filename"]}"'
-        )
-        return response
+        return build_download_response(result)
 
     @endpoint(
         name='get-viewer-url',
@@ -1845,26 +1432,7 @@ class GoodflagResource(BaseResource):
 
         client = self._get_client()
         result = client.download_evidence_certificate(workflow_id, streaming=True)
-
-        if 'response' in result:
-            # Mode streaming
-            streaming_response = StreamingHttpResponse(
-                result['response'].iter_content(chunk_size=8192),
-                content_type=result['content_type'],
-            )
-            streaming_response['Content-Disposition'] = (
-                f'attachment; filename="{result["filename"]}"'
-            )
-            return streaming_response
-
-        response = HttpResponse(
-            result['content'],
-            content_type=result['content_type'],
-        )
-        response['Content-Disposition'] = (
-            f'attachment; filename="{result["filename"]}"'
-        )
-        return response
+        return build_download_response(result)
 
     @endpoint(
         name='webhook',
@@ -1884,10 +1452,10 @@ class GoodflagResource(BaseResource):
 
         Sécurité :
         - Goodflag ne signe pas ses webhooks (pas de HMAC).
-        - On valide par token dans l'URL (webhook_secret) et/ou
-          par re-validation via l'API webhookEvents.
-        - Idempotence par event_id unique.
-        - Journalisation complète.
+        - Si webhook_secret est configuré, le token URL est vérifié.
+        - Si webhook_secret est absent, la revalidation API est obligatoire
+          et son échec entraîne un rejet.
+        - Idempotence atomique par event_id unique.
         """
         # Validation par token URL si configuré
         if self.webhook_secret:
@@ -1898,6 +1466,10 @@ class GoodflagResource(BaseResource):
                     provided_token[:4] + '...' if provided_token else '(empty)',
                 )
                 return JsonResponse({'error': 'Invalid token'}, status=403)
+        else:
+            # Sans secret, on ne peut pas valider par token — on accepte
+            # uniquement si la revalidation API réussit (vérifié dans le service)
+            pass
 
         try:
             payload = json.loads(request.body)
@@ -1905,98 +1477,24 @@ class GoodflagResource(BaseResource):
             logger.warning("Webhook received with invalid JSON body")
             return JsonResponse({'error': 'Invalid JSON'}, status=400)
 
-        # Structure du webhook event Goodflag
-        event_id = payload.get('id', '')
-        event_type = payload.get('eventType', '')
-        workflow_id = payload.get('workflowId', '')
+        client = self._get_client()
+        result = process_webhook(self, payload, client)
 
-        # Rejeter les webhooks sans event_id : sans lui, impossible d'assurer
-        # l'idempotence (anti-rejeu) ni la re-validation via l'API Goodflag.
-        if not event_id:
-            logger.warning("Webhook received without event_id, rejecting")
-            return JsonResponse({'error': 'Missing event id'}, status=400)
-        webhook_id = payload.get('webhookId', '')
-        step_id = payload.get('stepId', '')
-        created = payload.get('created', '')
+        status_code = result.pop('status_code', 200)
 
-        logger.info(
-            "Webhook received: event_id=%s, event_type=%s, workflow_id=%s",
-            event_id, event_type, workflow_id
-        )
+        # Notification WCS si événement significatif et traitement réussi
+        if result.get('status') == 'ok':
+            event_type = payload.get('eventType') or payload.get('event', '')
+            workflow_id = payload.get('workflowId') or payload.get('workflow_id', '')
+            if event_type in self._NOTIFY_EVENT_TYPES:
+                # Récupérer le statut normalisé depuis la trace mise à jour
+                trace = GoodflagWorkflowTrace.objects.filter(
+                    resource=self, goodflag_workflow_id=workflow_id,
+                ).first()
+                normalized = trace.status if trace else ''
+                self._notify_wcs(workflow_id, event_type, normalized, payload.get('id', ''))
 
-        # Anti-rejeu : vérifier si cet événement a déjà été traité
-        if event_id:
-            already_exists = GoodflagWebhookEvent.objects.filter(
-                resource=self,
-                event_id=event_id,
-            ).exists()
-            if already_exists:
-                logger.info(
-                    "Webhook event already processed, skipping: event_id=%s",
-                    event_id
-                )
-                return JsonResponse({'status': 'already_processed'})
-
-        # Re-validation via l'API Goodflag : vérifier que l'événement
-        # existe réellement dans Goodflag
-        raw_status = ''
-        normalized_status = ''
-        if event_id and workflow_id:
-            try:
-                client = self._get_client()
-                # Vérifier l'événement via l'API webhookEvents
-                verified_event = client.get_webhook_event(event_id)
-                if verified_event.get('workflowId') != workflow_id:
-                    logger.warning(
-                        "Webhook event workflowId mismatch: "
-                        "received=%s, verified=%s",
-                        workflow_id, verified_event.get('workflowId')
-                    )
-                    return JsonResponse(
-                        {'error': 'Event verification failed'}, status=403
-                    )
-
-                # Récupérer le statut actuel du workflow
-                wf_data = client.get_workflow(workflow_id)
-                raw_status = wf_data.get('status', '')
-                normalized_status = wf_data.get('normalized_status', '')
-            except GoodflagError as exc:
-                logger.warning(
-                    "Failed to re-validate webhook via API: %s", exc
-                )
-                # On accepte quand même l'événement mais on le note
-                raw_status = 'unverified'
-                normalized_status = 'error'
-
-        # Enregistrement de l'événement
-        GoodflagWebhookEvent.objects.create(
-            resource=self,
-            event_id=event_id,
-            event_type=event_type,
-            goodflag_workflow_id=workflow_id,
-            webhook_id=webhook_id,
-            step_id=step_id,
-            raw_status=raw_status,
-            normalized_status=normalized_status,
-            payload_json=json.dumps(payload),
-            timestamp_goodflag=str(created),
-        )
-
-        # Mise à jour de la trace workflow
-        if workflow_id and normalized_status:
-            GoodflagWorkflowTrace.objects.filter(
-                resource=self,
-                goodflag_workflow_id=workflow_id,
-            ).update(
-                status=normalized_status,
-                updated_at=timezone.now(),
-            )
-
-        # Notification WCS si événement significatif
-        if event_type in self._NOTIFY_EVENT_TYPES:
-            self._notify_wcs(workflow_id, event_type, normalized_status, event_id)
-
-        return JsonResponse({'status': 'ok'})
+        return JsonResponse(result, status=status_code)
 
     @endpoint(
         name='retrieve-by-external-ref',
@@ -2016,31 +1514,9 @@ class GoodflagResource(BaseResource):
         },
     )
     def retrieve_by_external_ref(self, request, external_ref):
-        if not external_ref:
-            raise GoodflagValidationError("'external_ref' is required")
-
-        traces = GoodflagWorkflowTrace.objects.filter(
-            resource=self,
-            external_ref=external_ref,
-        ).order_by('-created_at')
-
-        results = []
-        for trace in traces:
-            results.append({
-                'workflow_id': trace.goodflag_workflow_id,
-                'workflow_name': trace.workflow_name,
-                'external_ref': trace.external_ref,
-                'status': trace.status,
-                'created_at': trace.created_at.isoformat(),
-                'updated_at': trace.updated_at.isoformat(),
-            })
-
-        return {
-            'data': {
-                'count': len(results),
-                'results': results,
-            }
-        }
+        client = self._get_client()
+        data = _svc_retrieve_by_external_ref(self, external_ref, client=client)
+        return {'data': data}
 
     @endpoint(
         name='resend-invite',
@@ -2269,8 +1745,6 @@ class GoodflagWebhookEvent(models.Model):
     event_id = models.CharField(
         _('ID événement Goodflag'),
         max_length=256,
-        blank=True,
-        default='',
         db_index=True,
         help_text=_('Format: wbe_xxx'),
     )
@@ -2345,11 +1819,9 @@ class GoodflagWebhookEvent(models.Model):
     class Meta:
         verbose_name = _('Événement webhook Goodflag')
         verbose_name_plural = _('Événements webhook Goodflag')
+        # Contrainte d'unicité pour garantir l'idempotence atomique
+        unique_together = [('resource', 'event_id')]
         indexes = [
-            models.Index(
-                fields=['resource', 'event_id'],
-                name='gf_webhook_resource_evtid_idx',
-            ),
             models.Index(
                 fields=['resource', 'goodflag_workflow_id'],
                 name='gf_webhook_resource_wfid_idx',

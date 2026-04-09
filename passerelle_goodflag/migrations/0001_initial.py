@@ -167,9 +167,7 @@ class Migration(migrations.Migration):
             fields=[
                 ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
                 ('event_id', models.CharField(
-                    blank=True,
                     db_index=True,
-                    default='',
                     help_text='Format: wbe_xxx',
                     max_length=256,
                     verbose_name='ID événement Goodflag',
@@ -217,8 +215,8 @@ class Migration(migrations.Migration):
             options={
                 'verbose_name': 'Événement webhook Goodflag',
                 'verbose_name_plural': 'Événements webhook Goodflag',
+                'unique_together': {('resource', 'event_id')},
                 'indexes': [
-                    models.Index(fields=['resource', 'event_id'], name='gf_webhook_resource_evtid_idx'),
                     models.Index(fields=['resource', 'goodflag_workflow_id'], name='gf_webhook_resource_wfid_idx'),
                 ],
             },

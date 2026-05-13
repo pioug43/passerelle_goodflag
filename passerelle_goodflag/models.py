@@ -13,7 +13,7 @@ from django.utils.translation import gettext_lazy as _
 from passerelle.base.models import BaseResource
 from passerelle.utils.api import endpoint
 
-from .client import GoodflagClient
+from .client import MAX_UPLOAD_SIZE, GoodflagClient
 from .exceptions import GoodflagError, GoodflagValidationError
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 # Auth params injected in URL/body by Passerelle signed-request middleware
 _PASSERELLE_AUTH_PARAMS = frozenset({'orig', 'algo', 'timestamp', 'nonce', 'signature'})
 _MAX_RECIPIENTS = 100
-MAX_B64_LEN = int(50 * 1024 * 1024 * 4 / 3) + 1024
+_FILE_URL_TIMEOUT = 30
+_FILE_URL_CHUNK = 64 * 1024
+MAX_B64_LEN = int(MAX_UPLOAD_SIZE * 4 / 3) + 1024
 
 
 def _get_param(payload, key, default=None):
@@ -31,6 +33,13 @@ def _get_param(payload, key, default=None):
     if val == '' and default is not None:
         return default
     return val
+
+
+def _parse_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _validate_file_url(url):
@@ -202,10 +211,25 @@ def _extract_file(payload, request, passerelle_session):
     elif _get_param(payload, 'file_url'):
         file_url = _get_param(payload, 'file_url')
         _validate_file_url(file_url)
-        resp = passerelle_session.get(file_url)
+        resp = passerelle_session.get(file_url, stream=True, timeout=_FILE_URL_TIMEOUT)
         if resp.status_code != 200:
+            resp.close()
             raise GoodflagError(f"Failed to fetch file from URL: HTTP {resp.status_code}")
-        content = resp.content
+        # Streamé pour éviter qu'un file_url malveillant ne sature la mémoire :
+        # on coupe dès que la limite serveur (MAX_UPLOAD_SIZE) est dépassée.
+        buf = bytearray()
+        try:
+            for chunk in resp.iter_content(chunk_size=_FILE_URL_CHUNK):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if len(buf) > MAX_UPLOAD_SIZE:
+                    raise GoodflagValidationError(
+                        f"File at file_url exceeds maximum allowed size ({MAX_UPLOAD_SIZE} bytes)"
+                    )
+        finally:
+            resp.close()
+        content = bytes(buf)
         content_type = _sniff_content_type(content, content_type)
 
     if not content:
@@ -267,39 +291,43 @@ class GoodflagResource(BaseResource):
     # -- Helpers ----------------------------------------------------------
 
     def _parse_payload(self, request, **kwargs):
-        content_type = request.content_type or ''
-        body = request.body
+        """Merge query string + body (JSON or form-encoded) + Django URL kwargs."""
         payload = {}
 
-        for k, v in request.GET.lists():
-            if k not in _PASSERELLE_AUTH_PARAMS:
-                payload[k] = v[0] if len(v) == 1 else v
+        def _merge_multivalued(items):
+            for key, values in items:
+                if key in _PASSERELLE_AUTH_PARAMS:
+                    continue
+                payload[key] = values[0] if len(values) == 1 else values
 
+        def _merge_dict(data):
+            payload.update({k: v for k, v in data.items()
+                            if k not in _PASSERELLE_AUTH_PARAMS})
+
+        _merge_multivalued(request.GET.lists())
+
+        content_type = request.content_type or ''
+        body = request.body
         if 'application/json' in content_type:
             try:
-                body_data = json.loads(body)
-                if isinstance(body_data, dict):
-                    payload.update({k: v for k, v in body_data.items()
-                                    if k not in _PASSERELLE_AUTH_PARAMS})
+                data = json.loads(body)
             except (ValueError, TypeError):
                 if not payload:
                     raise GoodflagValidationError("Invalid JSON body")
+                data = None
+            if isinstance(data, dict):
+                _merge_dict(data)
         elif request.POST:
-            for k, v in request.POST.lists():
-                if k not in _PASSERELLE_AUTH_PARAMS:
-                    payload[k] = v[0] if len(v) == 1 else v
+            _merge_multivalued(request.POST.lists())
         elif body:
             try:
-                body_data = json.loads(body)
-                if isinstance(body_data, dict):
-                    payload.update({k: v for k, v in body_data.items()
-                                    if k not in _PASSERELLE_AUTH_PARAMS})
+                data = json.loads(body)
+                if isinstance(data, dict):
+                    _merge_dict(data)
             except (ValueError, TypeError):
                 pass
 
-        if kwargs:
-            payload.update({k: v for k, v in kwargs.items() if v is not None})
-
+        payload.update({k: v for k, v in kwargs.items() if v is not None})
         return payload
 
     def _get_client(self):
@@ -311,7 +339,7 @@ class GoodflagResource(BaseResource):
         )
 
     def _resolve_workflow_id(self, payload):
-        """Resolve workflow_id, optionally from external_ref via Goodflag search API."""
+        """workflow_id direct, ou recherche via external_ref/display_id/uuid."""
         workflow_id = _get_param(payload, 'workflow_id')
         if workflow_id:
             return workflow_id
@@ -320,9 +348,8 @@ class GoodflagResource(BaseResource):
                         or _get_param(payload, 'uuid'))
         if not external_ref:
             return None
-        client = self._get_client()
         try:
-            search = client.search_workflows(text=external_ref)
+            search = self._get_client().search_workflows(text=external_ref)
         except GoodflagError as exc:
             logger.warning("Resolving external_ref=%s failed: %s", external_ref, exc)
             return None
@@ -332,6 +359,20 @@ class GoodflagResource(BaseResource):
             if external_ref in (wf.get('name') or ''):
                 return wf.get('id')
         return None
+
+    def _require_workflow_id(self, payload):
+        """Comme _resolve_workflow_id mais lève une erreur explicite si introuvable."""
+        workflow_id = self._resolve_workflow_id(payload)
+        if workflow_id:
+            return workflow_id
+        external_ref = (_get_param(payload, 'external_ref')
+                        or _get_param(payload, 'display_id')
+                        or _get_param(payload, 'uuid'))
+        if external_ref:
+            raise GoodflagValidationError(
+                f"No Goodflag workflow found for external_ref={external_ref!r}"
+            )
+        raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
 
     def check_status(self):
         result = self._get_client().test_connection()
@@ -394,9 +435,7 @@ class GoodflagResource(BaseResource):
     )
     def upload_document(self, request, **kwargs):
         payload = self._parse_payload(request, **kwargs)
-        workflow_id = self._resolve_workflow_id(payload)
-        if not workflow_id:
-            raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
+        workflow_id = self._require_workflow_id(payload)
         signature_profile_id = (_get_param(payload, 'signature_profile_id')
                                 or self.default_signature_profile_id)
         file_content, filename, content_type = _extract_file(payload, request, self.requests)
@@ -411,24 +450,16 @@ class GoodflagResource(BaseResource):
         description=_('Démarre un workflow Goodflag (envoie les invitations).'),
     )
     def start_workflow(self, request, **kwargs):
-        payload = self._parse_payload(request, **kwargs)
-        workflow_id = self._resolve_workflow_id(payload)
-        if not workflow_id:
-            raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
-        result = self._get_client().patch_workflow_status(workflow_id, 'started')
-        return {'data': result}
+        workflow_id = self._require_workflow_id(self._parse_payload(request, **kwargs))
+        return {'data': self._get_client().patch_workflow_status(workflow_id, 'started')}
 
     @endpoint(
         name='stop-workflow', perm='can_access', methods=['post'],
         description=_('Arrête un workflow Goodflag.'),
     )
-    def stop_workflow(self, request, workflow_id=None, external_ref=None):
-        if not workflow_id:
-            workflow_id = self._resolve_workflow_id(self._parse_payload(request))
-        if not workflow_id:
-            raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
-        result = self._get_client().patch_workflow_status(workflow_id, 'stopped')
-        return {'data': result}
+    def stop_workflow(self, request, **kwargs):
+        workflow_id = self._require_workflow_id(self._parse_payload(request, **kwargs))
+        return {'data': self._get_client().patch_workflow_status(workflow_id, 'stopped')}
 
     @endpoint(
         name='resend-invite', perm='can_access', methods=['post'],
@@ -436,24 +467,18 @@ class GoodflagResource(BaseResource):
     )
     def resend_invite(self, request, **kwargs):
         payload = self._parse_payload(request, **kwargs)
-        workflow_id = self._resolve_workflow_id(payload)
-        if not workflow_id:
-            raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
+        workflow_id = self._require_workflow_id(payload)
         email = _get_param(payload, 'recipient_email')
         if not email:
             raise GoodflagValidationError("'recipient_email' is required")
-        result = self._get_client().send_invite(workflow_id, email)
-        return {'data': result}
+        return {'data': self._get_client().send_invite(workflow_id, email)}
 
     @endpoint(
         name='sync-status', perm='can_access', methods=['get'],
         description=_('Statut normalisé d\'un workflow (draft, started, finished, refused, error).'),
     )
-    def sync_status(self, request, workflow_id=None, external_ref=None):
-        if not workflow_id:
-            workflow_id = self._resolve_workflow_id(request.GET)
-        if not workflow_id:
-            raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
+    def sync_status(self, request, **kwargs):
+        workflow_id = self._require_workflow_id(self._parse_payload(request, **kwargs))
         result = self._get_client().get_workflow(workflow_id)
         normalized = result.get('normalized_status', 'error')
         return {'data': {
@@ -469,16 +494,10 @@ class GoodflagResource(BaseResource):
         description=_('Liste/recherche les workflows Goodflag.'),
     )
     def list_workflows(self, request, **kwargs):
-        params = request.GET
-        text = params.get('text') or None
-        try:
-            page_index = int(params.get('page', 0))
-        except (TypeError, ValueError):
-            page_index = 0
-        try:
-            items_per_page = min(int(params.get('per_page', 50)), 100)
-        except (TypeError, ValueError):
-            items_per_page = 50
+        payload = self._parse_payload(request, **kwargs)
+        text = _get_param(payload, 'text') or None
+        page_index = _parse_int(_get_param(payload, 'page'), default=0)
+        items_per_page = min(_parse_int(_get_param(payload, 'per_page'), default=50), 100)
         result = self._get_client().search_workflows(
             text=text, items_per_page=items_per_page, page_index=page_index,
         )
@@ -500,11 +519,8 @@ class GoodflagResource(BaseResource):
         name='get-workflow', perm='can_access', methods=['get'],
         description=_('Récupère le détail d\'un workflow Goodflag.'),
     )
-    def get_workflow(self, request, workflow_id=None, external_ref=None):
-        if not workflow_id:
-            workflow_id = self._resolve_workflow_id(request.GET)
-        if not workflow_id:
-            raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
+    def get_workflow(self, request, **kwargs):
+        workflow_id = self._require_workflow_id(self._parse_payload(request, **kwargs))
         return {'data': self._get_client().get_workflow(workflow_id)}
 
     @endpoint(
@@ -516,21 +532,16 @@ class GoodflagResource(BaseResource):
         document_id = _get_param(payload, 'document_id')
         if not document_id:
             raise GoodflagValidationError("'document_id' is required")
-        result = self._get_client().get_document_viewer_url(
+        return {'data': self._get_client().get_document_viewer_url(
             document_id,
             redirect_url=_get_param(payload, 'redirect_url'),
             expired=_get_param(payload, 'expired'),
-        )
-        return {'data': result}
+        )}
 
     @endpoint(
         name='download-signed-documents', perm='can_access', methods=['get'],
         description=_('Télécharge les documents signés d\'un workflow terminé.'),
     )
-    def download_signed_documents(self, request, workflow_id=None, external_ref=None):
-        if not workflow_id:
-            workflow_id = self._resolve_workflow_id(request.GET)
-        if not workflow_id:
-            raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
-        result = self._get_client().download_signed_documents(workflow_id)
-        return _download_response(result)
+    def download_signed_documents(self, request, **kwargs):
+        workflow_id = self._require_workflow_id(self._parse_payload(request, **kwargs))
+        return _download_response(self._get_client().download_signed_documents(workflow_id))

@@ -116,6 +116,7 @@ def test_start_stop_workflow(connector, factory):
 @responses.activate
 def test_sync_status_normalization(connector, factory):
     for raw, normalized, is_final in [('finished', 'finished', True),
+                                      ('archived', 'finished', True),
                                       ('started', 'started', False),
                                       ('stopped', 'refused', True)]:
         responses.reset()
@@ -124,6 +125,32 @@ def test_sync_status_normalization(connector, factory):
         result = connector.sync_status(factory.get('/x'), workflow_id='wfl_Test001')
         assert result['data']['status'] == normalized
         assert result['data']['is_final'] is is_final
+
+
+def test_upload_document_file_url_size_limit(connector, factory, monkeypatch):
+    from passerelle_goodflag.client import MAX_UPLOAD_SIZE
+
+    class OversizedResponse:
+        status_code = 200
+
+        def iter_content(self, chunk_size):
+            yield b'%PDF-1.4 '
+            sent = 0
+            while sent <= MAX_UPLOAD_SIZE:
+                blob = b'\0' * chunk_size
+                yield blob
+                sent += len(blob)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(connector.requests, 'get',
+                        lambda *a, **kw: OversizedResponse())
+    with pytest.raises(GoodflagValidationError, match='exceeds maximum'):
+        connector.upload_document(_post(factory, {
+            'workflow_id': 'wfl_Test001',
+            'file_url': 'https://wcs.example.com/huge.pdf',
+        }))
 
 
 @responses.activate

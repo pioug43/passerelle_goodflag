@@ -24,8 +24,9 @@ STATUS_MAP = {
     'draft': 'draft',
     'started': 'started',
     'stopped': 'refused',
+    # archived = finished + archivé côté Goodflag, traité comme terminal côté W.C.S.
     'finished': 'finished',
-    'archived': 'archived',
+    'archived': 'finished',
 }
 
 

@@ -58,6 +58,165 @@ URLs : `{passerelle_url}passerelle-goodflag/{slug}/{endpoint}`
 
 La plupart des endpoints acceptent `external_ref` à la place de `workflow_id` : la résolution est faite via l'API de recherche Goodflag (`data1`-`data16` ou nom du workflow).
 
+### Référence par endpoint
+
+Tous les endpoints renvoient `{"data": {…}}` en cas de succès (sauf `download-signed-documents` qui renvoie un flux binaire). Erreurs : HTTP 4xx/5xx avec `{"err": 1, "err_desc": "…"}`.
+
+#### `POST create-workflow`
+
+Crée un workflow vide en `draft`. Pas de document, pas d'envoi d'invitation.
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `name` | oui | Nom du workflow (ex: `Signature {{ form_number }}`) |
+| `recipient_email` / `_firstname` / `_lastname` / `_phone` | * | Signataire unique (form-encoded) |
+| `recipients_N_email` / `_firstname` / `_lastname` / `_phone` | * | Multi-signataires indexés (N=0,1,2…) |
+| `recipients` | * | JSON, alternative aux deux formats ci-dessus |
+| `steps` | * | JSON natif Goodflag (multi-étapes), exclusif avec `recipients` |
+| `metadata` | non | Dict `{"data1": …, …, "data16": …}` (cf. § Métadonnées) |
+| `workflow_mode` | non | `FULL` (défaut) ou `LIGHT` |
+| `layout_id` | non | Surcharge `default_layout_id` |
+
+\* l'un des quatre formats de destinataires est requis.
+
+Réponse :
+```json
+{"data": {"workflow_id": "wfl_xxx", "status": "draft"}}
+```
+
+#### `POST submit-workflow`
+
+Pipeline complet en un appel : `create-workflow` + `upload-document` + `start-workflow`.
+
+Mêmes params que `create-workflow` + ceux d'`upload-document` (`file`/`file_base64`/`file_url`/multipart).
+
+Réponse :
+```json
+{"data": {"workflow_id": "wfl_xxx", "status": "started", "document_id": "doc_xxx"}}
+```
+
+#### `POST upload-document`
+
+Upload un document dans un workflow `draft` existant.
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `workflow_id` ou `external_ref` | oui | Cible du workflow |
+| `file` (dict JSON) | * | `{"filename":…, "content_type":…, "content": "<base64>"}` |
+| `file_base64` + `filename` | * | Base64 direct |
+| `file_url` | * | URL HTTPS Publik, récupérée côté Passerelle (cf. § Upload) |
+| `file` (multipart) | * | Upload multipart standard |
+| `signature_profile_id` | non | Surcharge `default_signature_profile_id` |
+
+\* une des quatre sources est requise.
+
+Réponse : `{"data": {"workflow_id": "wfl_xxx", "document_id": "doc_xxx", "filename": "…", "documents": […], "parts": […]}}`
+
+#### `POST start-workflow`
+
+Bascule le workflow en `started` et envoie les invitations email.
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `workflow_id` ou `external_ref` | oui | Cible du workflow |
+
+Réponse : `{"data": {"workflow_id": "wfl_xxx", "status": "started"}}`
+
+#### `POST stop-workflow`
+
+Arrête un workflow en cours (passage à `stopped` côté Goodflag, qui sera vu comme `refused` côté Publik).
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `workflow_id` ou `external_ref` | oui | Cible du workflow |
+
+Réponse : `{"data": {"workflow_id": "wfl_xxx", "status": "stopped"}}`
+
+#### `POST resend-invite`
+
+Renvoie une invitation email à un destinataire (relance).
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `workflow_id` ou `external_ref` | oui | Cible du workflow |
+| `recipient_email` | oui | Email du destinataire à relancer |
+
+Réponse : `{"data": {"invite_url": "https://…", "workflow_id": "wfl_xxx", "recipient_email": "…"}}`
+
+#### `GET sync-status`
+
+Statut normalisé pour polling W.C.S. (le format préféré pour les workflows de signature).
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `workflow_id` ou `external_ref` | oui | Cible du workflow |
+
+Réponse :
+```json
+{"data": {
+  "workflow_id": "wfl_xxx",
+  "raw_status": "started",
+  "status": "started",
+  "progress": 50,
+  "is_final": false
+}}
+```
+
+Cf. § Mapping des statuts.
+
+#### `GET list-workflows`
+
+Liste et recherche les workflows (utile pour supervision ou diagnostic).
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `text` | non | Recherche texte (sur nom et métadonnées) |
+| `page` | non | Index 0-based (défaut: 0) |
+| `per_page` | non | Items par page (défaut: 50, max: 100) |
+
+Réponse :
+```json
+{"data": {
+  "total": 42, "page": 0, "per_page": 50,
+  "items": [
+    {"workflow_id": "wfl_xxx", "name": "…", "status": "started",
+     "progress": 50, "created": "…", "updated": "…"}
+  ]
+}}
+```
+
+#### `GET get-workflow`
+
+Détail complet d'un workflow (statut brut Goodflag + steps + métadonnées).
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `workflow_id` ou `external_ref` | oui | Cible du workflow |
+
+Réponse : `{"data": {"workflow_id": "wfl_xxx", "status": "started", "normalized_status": "started", "name": "…", "progress": 50, "steps": […], "raw": {…}}}`
+
+#### `GET / POST get-viewer-url`
+
+URL de visualisation d'un document (ouverture dans le navigateur, hors signature).
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `document_id` | oui | ID Goodflag du document |
+| `redirect_url` | non | URL de retour après fermeture |
+| `expired` | non | Date d'expiration de l'URL (ISO 8601) |
+
+Réponse : `{"data": {"viewer_url": "https://…", "expired": "…", "document_id": "doc_xxx"}}`
+
+#### `GET download-signed-documents`
+
+Télécharge les documents signés d'un workflow terminé. Retourne le flux binaire (PDF unique, ou ZIP si plusieurs documents) avec `Content-Disposition: attachment; filename="…"`.
+
+| Param | Obligatoire | Description |
+|---|:---:|---|
+| `workflow_id` ou `external_ref` | oui | Cible du workflow (doit être `finished`) |
+
+Réponse : flux binaire (pas de wrapper `data`). Côté W.C.S., utiliser un champ « Téléchargement de fichier » pointant vers cet endpoint.
+
 ## Formats de destinataires (create-workflow / submit-workflow)
 
 Trois formats supportés, mutuellement exclusifs avec `steps` (format natif Goodflag) :
@@ -125,6 +284,5 @@ passerelle_goodflag/
 └── migrations/
 tests/
 ├── conftest.py
-├── test_client.py
 └── test_connector.py
 ```

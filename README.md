@@ -33,11 +33,10 @@ Dans l'admin Passerelle → **Signature électronique** → **Ajouter un connect
 | `default_consent_page_id` | recommandé | Page de consentement par défaut (format: `cop_xxx`) |
 | `default_signature_profile_id` | recommandé | Profil de signature par défaut (format: `sip_xxx`) |
 | `default_layout_id` | | Layout pour les métadonnées (format: `lay_xxx`) |
-| `webhook_secret` | | Token de validation passé en query string par Goodflag (`?token=...`) |
 | `timeout` | | Timeout HTTP en secondes (défaut: 30) |
 | `verify_ssl` | | Vérification SSL (défaut: activé) |
 
-Dans l'onglet **Sécurité** : ajouter le rôle de service W.C.S. en `can_access`. Le webhook (`/webhook`) est en permission `open`.
+Dans l'onglet **Sécurité** : ajouter le rôle de service W.C.S. en `can_access`.
 
 ## Endpoints
 
@@ -50,13 +49,12 @@ URLs : `{passerelle_url}passerelle-goodflag/{slug}/{endpoint}`
 | `upload-document` | POST | Upload un document (PDF/DOCX/Images) |
 | `start-workflow` | POST | Démarre le workflow (envoie les invitations) |
 | `stop-workflow` | POST | Arrête un workflow en cours |
-| `get-workflow` | GET | Détail complet d'un workflow |
+| `resend-invite` | POST | Renvoie une invitation email à un destinataire |
 | `sync-status` | GET | Statut normalisé (draft/started/finished/refused/error) |
-| `create-invite` | POST | URL d'invitation pour un destinataire |
+| `list-workflows` | GET | Liste/recherche les workflows (pagination + texte) |
+| `get-workflow` | GET | Détail complet d'un workflow |
+| `get-viewer-url` | GET, POST | URL de visualisation d'un document |
 | `download-signed-documents` | GET | Documents signés (PDF ou ZIP, streaming) |
-| `download-evidence` | GET | Certificat de preuve |
-| `retrieve-by-external-ref` | GET | Recherche workflows par référence Publik (via API Goodflag) |
-| `webhook` | POST | Notifications Goodflag (permission `open`) |
 
 La plupart des endpoints acceptent `external_ref` à la place de `workflow_id` : la résolution est faite via l'API de recherche Goodflag (`data1`-`data16` ou nom du workflow).
 
@@ -94,16 +92,6 @@ recipients_1_firstname=Bob
 | `finished` | `finished` | oui | Télécharger le document signé |
 | `stopped` | `refused` | oui | Notifier le demandeur |
 | autre | `error` | oui | Alerter l'administrateur |
-
-## Webhook
-
-Configurer Goodflag pour envoyer un webhook vers :
-
-```
-https://passerelle.example.com/passerelle-goodflag/{slug}/webhook?token=<webhook_secret>
-```
-
-Sécurité : Goodflag ne signe pas ses webhooks (pas de HMAC). Le connecteur valide soit par le token URL (si `webhook_secret` configuré), soit par re-validation auprès de l'API `webhookEvents` Goodflag.
 
 ## Métadonnées
 

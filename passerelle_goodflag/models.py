@@ -1,5 +1,4 @@
 import base64
-import hmac
 import io
 import ipaddress
 import json
@@ -8,7 +7,7 @@ import zipfile
 from urllib.parse import unquote, urlparse
 
 from django.db import models
-from django.http import JsonResponse, StreamingHttpResponse
+from django.http import StreamingHttpResponse
 from django.utils.translation import gettext_lazy as _
 
 from passerelle.base.models import BaseResource
@@ -258,10 +257,6 @@ class GoodflagResource(BaseResource):
         _('ID de layout par défaut'), max_length=256, blank=True, default='',
         help_text=_('Format: lay_xxx, requis si vous utilisez des métadonnées'),
     )
-    webhook_secret = models.CharField(
-        _('Secret du webhook'), max_length=256, blank=True, default='',
-        help_text=_('Token de validation passé en query string par Goodflag (?token=...).'),
-    )
 
     category = _('Connecteurs métiers')
 
@@ -436,15 +431,19 @@ class GoodflagResource(BaseResource):
         return {'data': result}
 
     @endpoint(
-        name='get-workflow', perm='can_access', methods=['get'],
-        description=_('Récupère le détail d\'un workflow Goodflag.'),
+        name='resend-invite', perm='can_access', methods=['post'],
+        description=_('Renvoie une invitation par email à un destinataire d\'un workflow.'),
     )
-    def get_workflow(self, request, workflow_id=None, external_ref=None):
-        if not workflow_id:
-            workflow_id = self._resolve_workflow_id(request.GET)
+    def resend_invite(self, request, **kwargs):
+        payload = self._parse_payload(request, **kwargs)
+        workflow_id = self._resolve_workflow_id(payload)
         if not workflow_id:
             raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
-        return {'data': self._get_client().get_workflow(workflow_id)}
+        email = _get_param(payload, 'recipient_email')
+        if not email:
+            raise GoodflagValidationError("'recipient_email' is required")
+        result = self._get_client().send_invite(workflow_id, email)
+        return {'data': result}
 
     @endpoint(
         name='sync-status', perm='can_access', methods=['get'],
@@ -466,20 +465,61 @@ class GoodflagResource(BaseResource):
         }}
 
     @endpoint(
-        name='create-invite', perm='can_access', methods=['post'],
-        description=_('Crée une URL d\'invitation pour un destinataire d\'un workflow.'),
+        name='list-workflows', perm='can_access', methods=['get'],
+        description=_('Liste/recherche les workflows Goodflag.'),
     )
-    def create_invite(self, request, **kwargs):
-        payload = self._parse_payload(request, **kwargs)
-        workflow_id = self._resolve_workflow_id(payload)
+    def list_workflows(self, request, **kwargs):
+        params = request.GET
+        text = params.get('text') or None
+        try:
+            page_index = int(params.get('page', 0))
+        except (TypeError, ValueError):
+            page_index = 0
+        try:
+            items_per_page = min(int(params.get('per_page', 50)), 100)
+        except (TypeError, ValueError):
+            items_per_page = 50
+        result = self._get_client().search_workflows(
+            text=text, items_per_page=items_per_page, page_index=page_index,
+        )
+        return {'data': {
+            'total': result.get('totalItems', 0),
+            'page': page_index,
+            'per_page': items_per_page,
+            'items': [{
+                'workflow_id': wf.get('id'),
+                'name': wf.get('name'),
+                'status': wf.get('workflowStatus'),
+                'progress': wf.get('progress', 0),
+                'created': wf.get('created'),
+                'updated': wf.get('updated'),
+            } for wf in result.get('items', [])],
+        }}
+
+    @endpoint(
+        name='get-workflow', perm='can_access', methods=['get'],
+        description=_('Récupère le détail d\'un workflow Goodflag.'),
+    )
+    def get_workflow(self, request, workflow_id=None, external_ref=None):
+        if not workflow_id:
+            workflow_id = self._resolve_workflow_id(request.GET)
         if not workflow_id:
             raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
-        email = _get_param(payload, 'recipient_email')
-        if not email:
-            raise GoodflagValidationError("'recipient_email' is required")
-        result = self._get_client().create_invite(
-            workflow_id, email,
-            recipient_phone=_get_param(payload, 'recipient_phone'),
+        return {'data': self._get_client().get_workflow(workflow_id)}
+
+    @endpoint(
+        name='get-viewer-url', perm='can_access', methods=['get', 'post'],
+        description=_('Génère une URL de visualisation pour un document Goodflag.'),
+    )
+    def get_viewer_url(self, request, **kwargs):
+        payload = self._parse_payload(request, **kwargs)
+        document_id = _get_param(payload, 'document_id')
+        if not document_id:
+            raise GoodflagValidationError("'document_id' is required")
+        result = self._get_client().get_document_viewer_url(
+            document_id,
+            redirect_url=_get_param(payload, 'redirect_url'),
+            expired=_get_param(payload, 'expired'),
         )
         return {'data': result}
 
@@ -492,75 +532,5 @@ class GoodflagResource(BaseResource):
             workflow_id = self._resolve_workflow_id(request.GET)
         if not workflow_id:
             raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
-        result = self._get_client().download(workflow_id, 'downloadDocuments', 'signed_documents')
+        result = self._get_client().download_signed_documents(workflow_id)
         return _download_response(result)
-
-    @endpoint(
-        name='download-evidence', perm='can_access', methods=['get'],
-        description=_('Télécharge le certificat de preuve d\'un workflow terminé.'),
-    )
-    def download_evidence(self, request, workflow_id=None, external_ref=None):
-        if not workflow_id:
-            workflow_id = self._resolve_workflow_id(request.GET)
-        if not workflow_id:
-            raise GoodflagValidationError("'workflow_id' or 'external_ref' is required")
-        result = self._get_client().download(workflow_id, 'downloadEvidenceCertificate', 'evidence_certificate')
-        return _download_response(result)
-
-    @endpoint(
-        name='webhook', perm='open', methods=['post'],
-        description=_('Reçoit les notifications webhook de Goodflag.'),
-    )
-    def webhook(self, request):
-        """
-        Sécurité :
-        - Goodflag ne signe pas ses webhooks (pas de HMAC).
-        - Si webhook_secret est configuré, on valide le token URL.
-        - Sinon, on re-valide auprès de l'API webhookEvents de Goodflag.
-        """
-        if self.webhook_secret:
-            provided = request.GET.get('token', '')
-            if not hmac.compare_digest(provided, self.webhook_secret):
-                return JsonResponse({'error': 'Invalid token'}, status=403)
-
-        try:
-            payload = json.loads(request.body)
-        except (ValueError, TypeError):
-            return JsonResponse({'error': 'Invalid JSON'}, status=400)
-
-        event_id = payload.get('id', '')
-        workflow_id = payload.get('workflowId') or payload.get('workflow_id', '')
-        if not event_id:
-            return JsonResponse({'error': 'Missing event id'}, status=400)
-
-        if not self.webhook_secret and event_id and workflow_id:
-            try:
-                verified = self._get_client().get_webhook_event(event_id)
-                if verified.get('workflowId') != workflow_id:
-                    return JsonResponse({'error': 'Event verification failed'}, status=403)
-            except GoodflagError as exc:
-                logger.warning("Webhook revalidation failed for %s: %s", event_id, exc)
-                return JsonResponse({'error': 'Revalidation failed'}, status=403)
-
-        return JsonResponse({'status': 'ok'}, status=200)
-
-    @endpoint(
-        name='retrieve-by-external-ref', perm='can_access', methods=['get'],
-        description=_('Retrouve les workflows associés à une référence externe Publik via l\'API Goodflag.'),
-    )
-    def retrieve_by_external_ref(self, request, external_ref):
-        if not external_ref:
-            raise GoodflagValidationError("'external_ref' is required")
-        client = self._get_client()
-        search = client.search_workflows(text=external_ref)
-        results = []
-        for wf in search.get('items', []):
-            match = any(wf.get(f'data{i}') == external_ref for i in range(1, 17))
-            if match or external_ref in (wf.get('name') or ''):
-                results.append({
-                    'workflow_id': wf.get('id', ''),
-                    'workflow_name': wf.get('name', ''),
-                    'external_ref': external_ref,
-                    'status': wf.get('workflowStatus', ''),
-                })
-        return {'data': {'count': len(results), 'results': results}}

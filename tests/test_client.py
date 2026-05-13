@@ -185,54 +185,46 @@ class TestGetWorkflow:
             assert client.get_workflow('wfl_X')['normalized_status'] == expected
 
 
-class TestCreateInvite:
+class TestSendInvite:
     @responses.activate
     def test_success(self, client):
-        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_001/invite',
+        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_001/sendInvite',
                       json={'inviteUrl': 'https://goodflag.test/invite?token=eyJ'}, status=200)
-        result = client.create_invite('wfl_001', 'signer@example.com')
+        result = client.send_invite('wfl_001', 'signer@example.com')
         assert result['invite_url'].startswith('https://')
         body = json.loads(responses.calls[0].request.body)
         assert body['recipientEmail'] == 'signer@example.com'
 
 
-class TestDownload:
+class TestGetDocumentViewerUrl:
     @responses.activate
-    def test_signed_documents(self, client):
+    def test_success(self, client):
+        responses.add(responses.POST, f'{BASE_URL}/documents/doc_001/viewer',
+                      json={'viewerUrl': 'https://goodflag.test/viewer?t=eyJ',
+                            'expired': '2030-01-01T00:00:00Z'}, status=200)
+        result = client.get_document_viewer_url('doc_001', redirect_url='https://wcs/ret')
+        assert result['viewer_url'].startswith('https://')
+        body = json.loads(responses.calls[0].request.body)
+        assert body['redirectUrl'] == 'https://wcs/ret'
+
+
+class TestDownloadSignedDocuments:
+    @responses.activate
+    def test_success(self, client):
         responses.add(responses.GET, f'{BASE_URL}/workflows/wfl_001/downloadDocuments',
                       body=b'%PDF-1.4 signed', content_type='application/pdf',
                       headers={'Content-Disposition': 'attachment; filename="signed.pdf"'},
                       status=200)
-        result = client.download('wfl_001', 'downloadDocuments', 'default')
+        result = client.download_signed_documents('wfl_001')
         assert result['filename'] == 'signed.pdf'
         assert result['content_type'] == 'application/pdf'
-
-    @responses.activate
-    def test_evidence_certificate(self, client):
-        responses.add(responses.GET, f'{BASE_URL}/workflows/wfl_001/downloadEvidenceCertificate',
-                      body=b'%PDF-1.4 evidence', content_type='application/pdf',
-                      headers={'Content-Disposition': 'attachment; filename="evidence.pdf"'},
-                      status=200)
-        result = client.download('wfl_001', 'downloadEvidenceCertificate', 'default')
-        assert result['filename'] == 'evidence.pdf'
 
     @responses.activate
     def test_not_found(self, client):
         responses.add(responses.GET, f'{BASE_URL}/workflows/wfl_bad/downloadDocuments',
                       json={'message': 'The specified workflow can not be found.'}, status=404)
         with pytest.raises(GoodflagValidationError):
-            client.download('wfl_bad', 'downloadDocuments', 'default')
-
-
-class TestGetWebhookEvent:
-    @responses.activate
-    def test_success(self, client):
-        responses.add(responses.GET, f'{BASE_URL}/webhookEvents/wbe_Event001',
-                      json={'id': 'wbe_Event001', 'eventType': 'workflowFinished',
-                            'workflowId': 'wfl_001'}, status=200)
-        result = client.get_webhook_event('wbe_Event001')
-        assert result['id'] == 'wbe_Event001'
-        assert result['workflowId'] == 'wfl_001'
+            client.download_signed_documents('wfl_bad')
 
 
 class TestSearchWorkflows:

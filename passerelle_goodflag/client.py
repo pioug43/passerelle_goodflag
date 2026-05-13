@@ -199,29 +199,39 @@ class GoodflagClient:
             'raw': data,
         }
 
-    def create_invite(self, workflow_id, recipient_email, recipient_phone=None):
-        payload = {'recipientEmail': recipient_email}
-        if recipient_phone:
-            payload['recipientPhone'] = recipient_phone
-        data = self._request('POST', f'/workflows/{workflow_id}/invite', json_data=payload)
+    def send_invite(self, workflow_id, recipient_email):
+        data = self._request(
+            'POST', f'/workflows/{workflow_id}/sendInvite',
+            json_data={'recipientEmail': recipient_email},
+        )
         return {
             'invite_url': data.get('inviteUrl', ''),
             'workflow_id': workflow_id,
             'recipient_email': recipient_email,
         }
 
-    def download(self, workflow_id, endpoint, default_filename):
-        response = self._request('GET', f'/workflows/{workflow_id}/{endpoint}', stream=True)
+    def get_document_viewer_url(self, document_id, redirect_url=None, expired=None):
+        payload = {}
+        if redirect_url:
+            payload['redirectUrl'] = redirect_url
+        if expired:
+            payload['expired'] = expired
+        data = self._request('POST', f'/documents/{document_id}/viewer', json_data=payload)
+        return {
+            'viewer_url': data.get('viewerUrl', ''),
+            'expired': data.get('expired'),
+            'document_id': document_id,
+        }
+
+    def download_signed_documents(self, workflow_id):
+        response = self._request('GET', f'/workflows/{workflow_id}/downloadDocuments', stream=True)
         return {
             'response': response,
             'content_type': response.headers.get('Content-Type', 'application/octet-stream'),
             'filename': _parse_content_disposition_filename(
-                response.headers.get('Content-Disposition', ''), default_filename,
+                response.headers.get('Content-Disposition', ''), 'signed_documents',
             ),
         }
-
-    def get_webhook_event(self, webhook_event_id):
-        return self._request('GET', f'/webhookEvents/{webhook_event_id}')
 
     def search_workflows(self, text=None, items_per_page=50, page_index=0):
         params = {

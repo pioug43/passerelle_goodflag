@@ -8,14 +8,13 @@ import responses
 from django.test import RequestFactory
 
 from passerelle_goodflag.exceptions import GoodflagError, GoodflagValidationError
-from passerelle_goodflag.models import GoodflagResource
 
 from .conftest import (
     MOCK_INVITE_RESPONSE,
     MOCK_START_RESPONSE,
     MOCK_UPLOAD_RESPONSE,
     MOCK_VERSION_RESPONSE,
-    MOCK_WEBHOOK_EVENT,
+    MOCK_VIEWER_RESPONSE,
     MOCK_WORKFLOW_DETAIL,
     MOCK_WORKFLOW_LIST,
     MOCK_WORKFLOW_RESPONSE,
@@ -319,12 +318,12 @@ class TestSubmitWorkflow:
         assert data['document_id'] == 'doc_Doc001'
 
 
-class TestCreateInvite:
+class TestResendInvite:
     @responses.activate
     def test_success(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_Test001/invite',
+        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_Test001/sendInvite',
                       json=MOCK_INVITE_RESPONSE, status=200)
-        result = connector.create_invite(_json_post(factory, '/create-invite', {
+        result = connector.resend_invite(_json_post(factory, '/resend-invite', {
             'workflow_id': 'wfl_Test001',
             'recipient_email': 'signer@example.com',
         }))
@@ -332,9 +331,56 @@ class TestCreateInvite:
 
     def test_missing_email(self, connector, factory):
         with pytest.raises(GoodflagValidationError, match='recipient_email'):
-            connector.create_invite(_json_post(factory, '/create-invite', {
+            connector.resend_invite(_json_post(factory, '/resend-invite', {
                 'workflow_id': 'wfl_Test001',
             }))
+
+    def test_missing_workflow(self, connector, factory):
+        with pytest.raises(GoodflagValidationError, match='workflow_id'):
+            connector.resend_invite(_json_post(factory, '/resend-invite', {
+                'recipient_email': 'signer@example.com',
+            }))
+
+
+class TestGetViewerUrl:
+    @responses.activate
+    def test_success(self, connector, factory):
+        responses.add(responses.POST, f'{BASE_URL}/documents/doc_Doc001/viewer',
+                      json=MOCK_VIEWER_RESPONSE, status=200)
+        result = connector.get_viewer_url(_json_post(factory, '/get-viewer-url', {
+            'document_id': 'doc_Doc001',
+            'redirect_url': 'https://wcs.example.com/return',
+        }))
+        assert result['data']['viewer_url'].startswith('https://')
+
+    @responses.activate
+    def test_via_get(self, connector, factory):
+        responses.add(responses.POST, f'{BASE_URL}/documents/doc_Doc001/viewer',
+                      json=MOCK_VIEWER_RESPONSE, status=200)
+        result = connector.get_viewer_url(factory.get('/get-viewer-url?document_id=doc_Doc001'))
+        assert result['data']['viewer_url'].startswith('https://')
+
+    def test_missing_document(self, connector, factory):
+        with pytest.raises(GoodflagValidationError, match='document_id'):
+            connector.get_viewer_url(_json_post(factory, '/get-viewer-url', {}))
+
+
+class TestListWorkflows:
+    @responses.activate
+    def test_success(self, connector, factory):
+        responses.add(responses.GET, f'{BASE_URL}/workflows',
+                      json=MOCK_WORKFLOW_LIST, status=200)
+        result = connector.list_workflows(factory.get('/list-workflows?text=DEM'))
+        assert result['data']['total'] == 1
+        assert result['data']['items'][0]['workflow_id'] == 'wfl_Test001'
+
+    @responses.activate
+    def test_pagination(self, connector, factory):
+        responses.add(responses.GET, f'{BASE_URL}/workflows',
+                      json=MOCK_WORKFLOW_LIST, status=200)
+        result = connector.list_workflows(factory.get('/list-workflows?page=2&per_page=10'))
+        assert result['data']['page'] == 2
+        assert result['data']['per_page'] == 10
 
 
 class TestDownload:
@@ -349,40 +395,6 @@ class TestDownload:
         assert response['Content-Type'] == 'application/pdf'
         assert 'signed.pdf' in response['Content-Disposition']
 
-    @responses.activate
-    def test_evidence(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows/wfl_Test001/downloadEvidenceCertificate',
-                      body=b'%PDF-1.4 evidence', content_type='application/pdf',
-                      headers={'Content-Disposition': 'attachment; filename="evidence.pdf"'},
-                      status=200)
-        response = connector.download_evidence(factory.get('/download-evidence'),
-                                               workflow_id='wfl_Test001')
-        assert response['Content-Type'] == 'application/pdf'
-
-
-class TestRetrieveByExternalRef:
-    @responses.activate
-    def test_found(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows',
-                      json=MOCK_WORKFLOW_LIST, status=200)
-        result = connector.retrieve_by_external_ref(factory.get('/retrieve-by-external-ref'),
-                                                    external_ref='DEM-2024-001')
-        assert result['data']['count'] == 1
-        assert result['data']['results'][0]['workflow_id'] == 'wfl_Test001'
-
-    @responses.activate
-    def test_not_found(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows',
-                      json={'items': [], 'totalItems': 0}, status=200)
-        result = connector.retrieve_by_external_ref(factory.get('/retrieve-by-external-ref'),
-                                                    external_ref='DOES-NOT-EXIST')
-        assert result['data']['count'] == 0
-
-    def test_missing(self, connector, factory):
-        with pytest.raises(GoodflagValidationError):
-            connector.retrieve_by_external_ref(factory.get('/retrieve-by-external-ref'),
-                                               external_ref='')
-
 
 class TestExternalRefResolution:
     @responses.activate
@@ -394,58 +406,6 @@ class TestExternalRefResolution:
         result = connector.get_workflow(factory.get('/get-workflow?external_ref=DEM-2024-001'),
                                         external_ref='DEM-2024-001')
         assert result['data']['workflow_id'] == 'wfl_Test001'
-
-
-class TestWebhook:
-    def test_invalid_token(self, connector, factory):
-        request = factory.post('/webhook?token=wrong', data=json.dumps({'id': 'wbe_X'}),
-                               content_type='application/json')
-        response = connector.webhook(request)
-        assert response.status_code == 403
-
-    def test_valid_token_and_invalid_json(self, connector, factory):
-        request = factory.post('/webhook?token=webhook-secret-token', data='not-json',
-                               content_type='application/json')
-        response = connector.webhook(request)
-        assert response.status_code == 400
-
-    def test_missing_event_id(self, connector, factory):
-        request = factory.post('/webhook?token=webhook-secret-token',
-                               data=json.dumps({}), content_type='application/json')
-        response = connector.webhook(request)
-        assert response.status_code == 400
-
-    def test_valid_event(self, connector, factory):
-        payload = {'id': 'wbe_Event001', 'workflowId': 'wfl_Test001',
-                   'eventType': 'workflowFinished'}
-        request = factory.post('/webhook?token=webhook-secret-token',
-                               data=json.dumps(payload), content_type='application/json')
-        response = connector.webhook(request)
-        assert response.status_code == 200
-
-    @responses.activate
-    def test_revalidation_without_secret(self, connector, factory):
-        connector.webhook_secret = ''
-        connector.save()
-        responses.add(responses.GET, f'{BASE_URL}/webhookEvents/wbe_Event001',
-                      json=MOCK_WEBHOOK_EVENT, status=200)
-        payload = {'id': 'wbe_Event001', 'workflowId': 'wfl_Test001'}
-        request = factory.post('/webhook', data=json.dumps(payload),
-                               content_type='application/json')
-        response = connector.webhook(request)
-        assert response.status_code == 200
-
-    @responses.activate
-    def test_revalidation_mismatch(self, connector, factory):
-        connector.webhook_secret = ''
-        connector.save()
-        responses.add(responses.GET, f'{BASE_URL}/webhookEvents/wbe_Event001',
-                      json={'id': 'wbe_Event001', 'workflowId': 'wfl_Other'}, status=200)
-        payload = {'id': 'wbe_Event001', 'workflowId': 'wfl_Test001'}
-        request = factory.post('/webhook', data=json.dumps(payload),
-                               content_type='application/json')
-        response = connector.webhook(request)
-        assert response.status_code == 403
 
 
 class TestPayloadParsing:

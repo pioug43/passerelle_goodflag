@@ -19,7 +19,6 @@ def connector(db):
         default_consent_page_id='cop_DefaultConsent',
         default_signature_profile_id='sip_DefaultProfile',
         default_layout_id='lay_DefaultLayout',
-        webhook_secret='webhook-secret-token',
     )
 
 
@@ -57,8 +56,7 @@ MOCK_WORKFLOW_LIST = {
 
 MOCK_INVITE_RESPONSE = {'inviteUrl': 'https://goodflag.test/invite?token=eyJtest123'}
 
-MOCK_WEBHOOK_EVENT = {
-    'id': 'wbe_Event001',
-    'workflowId': 'wfl_Test001',
-    'eventType': 'workflowFinished',
+MOCK_VIEWER_RESPONSE = {
+    'viewerUrl': 'https://goodflag.test/viewer?token=eyJview123',
+    'expired': '2030-01-01T00:00:00Z',
 }

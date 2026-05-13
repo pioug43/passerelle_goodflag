@@ -47,11 +47,6 @@ class Migration(migrations.Migration):
                     help_text='Format: lay_xxx, requis si vous utilisez des métadonnées',
                     max_length=256, verbose_name='ID de layout par défaut',
                 )),
-                ('webhook_secret', models.CharField(
-                    blank=True, default='',
-                    help_text='Token de validation passé en query string par Goodflag (?token=...).',
-                    max_length=256, verbose_name='Secret du webhook',
-                )),
                 ('users', models.ManyToManyField(
                     blank=True, related_name='+', related_query_name='+', to='base.apiuser',
                 )),

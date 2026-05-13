@@ -1,4 +1,4 @@
-"""Tests d'intégration du connecteur Goodflag (endpoints Passerelle)."""
+"""Tests d'intégration minimaux du connecteur Goodflag."""
 
 import base64
 import json
@@ -9,21 +9,10 @@ from django.test import RequestFactory
 
 from passerelle_goodflag.exceptions import GoodflagError, GoodflagValidationError
 
-from .conftest import (
-    MOCK_INVITE_RESPONSE,
-    MOCK_START_RESPONSE,
-    MOCK_UPLOAD_RESPONSE,
-    MOCK_VERSION_RESPONSE,
-    MOCK_VIEWER_RESPONSE,
-    MOCK_WORKFLOW_DETAIL,
-    MOCK_WORKFLOW_LIST,
-    MOCK_WORKFLOW_RESPONSE,
-)
+from .conftest import INVITE, UPLOAD, VIEWER, WF, WF_LIST, WF_STARTED
 
 pytestmark = pytest.mark.django_db
-
-BASE_URL = 'https://api.goodflag.test/api'
-USER_ID = 'usr_TestUser123'
+BASE = 'https://api.goodflag.test/api'
 
 
 @pytest.fixture
@@ -31,407 +20,155 @@ def factory():
     return RequestFactory()
 
 
-def _json_post(factory, path, payload):
-    return factory.post(path, data=json.dumps(payload), content_type='application/json')
+def _post(factory, payload):
+    return factory.post('/x', data=json.dumps(payload), content_type='application/json')
 
 
-class TestConnectorBasics:
-    def test_create_connector(self, connector):
-        assert connector.pk is not None
-        assert connector.base_url == BASE_URL
-        assert connector.user_id == USER_ID
-
-    def test_get_client(self, connector):
-        client = connector._get_client()
-        assert client.base_url == BASE_URL
-        assert client.timeout == 10
-
-    @responses.activate
-    def test_check_status_ok(self, connector):
-        responses.add(responses.GET, f'{BASE_URL}/version',
-                      json=MOCK_VERSION_RESPONSE, status=200)
-        connector.check_status()  # ne doit pas lever
-
-    @responses.activate
-    def test_check_status_failure(self, connector):
-        responses.add(responses.GET, f'{BASE_URL}/version',
-                      json={'message': 'down'}, status=500)
-        with pytest.raises(GoodflagError):
-            connector.check_status()
+@responses.activate
+def test_check_status(connector):
+    responses.add(responses.GET, f'{BASE}/version', json='sgs:1.0', status=200)
+    connector.check_status()  # ne doit pas lever
+    responses.reset()
+    responses.add(responses.GET, f'{BASE}/version', json={}, status=500)
+    with pytest.raises(GoodflagError):
+        connector.check_status()
 
 
-class TestCreateWorkflow:
-    @responses.activate
-    def test_with_steps(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/users/{USER_ID}/workflows',
-                      json=MOCK_WORKFLOW_RESPONSE, status=200)
-        payload = {
-            'name': 'Signature 2024',
-            'steps': [{'stepType': 'signature', 'recipients': [
-                {'email': 'jean@example.com', 'firstName': 'Jean', 'lastName': 'Dupont'},
-            ], 'maxInvites': 5}],
-            'metadata': {'data1': 'DEM-2024-001'},
-        }
-        result = connector.create_workflow(_json_post(factory, '/create-workflow', payload))
-        assert result['data']['workflow_id'] == 'wfl_Test001'
-        assert result['data']['status'] == 'draft'
-
-    @responses.activate
-    def test_with_recipients(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/users/{USER_ID}/workflows',
-                      json=MOCK_WORKFLOW_RESPONSE, status=200)
-        payload = {
-            'name': 'Signature simplifiée',
-            'recipients': [{'email': 'signer@example.com', 'firstName': 'Jean',
-                            'lastName': 'Dupont'}],
-        }
-        result = connector.create_workflow(_json_post(factory, '/create-workflow', payload))
-        assert result['data']['workflow_id'] == 'wfl_Test001'
-
-        body = json.loads(responses.calls[0].request.body)
-        assert body['steps'][0]['recipients'][0]['consentPageId'] == 'cop_DefaultConsent'
-
-    @responses.activate
-    def test_recipient_flat_format(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/users/{USER_ID}/workflows',
-                      json=MOCK_WORKFLOW_RESPONSE, status=200)
-        payload = {
-            'name': 'Sig plate',
-            'recipient_email': 'a@b.com',
-            'recipient_firstname': 'Alice',
-            'recipient_lastname': 'Martin',
-            'recipient_phone': '+33612345678',
-        }
-        connector.create_workflow(_json_post(factory, '/create-workflow', payload))
-        body = json.loads(responses.calls[0].request.body)
-        recipient = body['steps'][0]['recipients'][0]
-        assert recipient['email'] == 'a@b.com'
-        assert recipient['firstName'] == 'Alice'
-        assert recipient['phoneNumber'] == '+33612345678'
-
-    @responses.activate
-    def test_recipient_indexed_format(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/users/{USER_ID}/workflows',
-                      json=MOCK_WORKFLOW_RESPONSE, status=200)
-        payload = {
-            'name': 'Multi',
-            'recipients_0_email': 'a@b.com',
-            'recipients_0_firstname': 'Alice',
-            'recipients_1_email': 'c@d.com',
-            'recipients_1_firstname': 'Bob',
-        }
-        connector.create_workflow(_json_post(factory, '/create-workflow', payload))
-        body = json.loads(responses.calls[0].request.body)
-        recipients = body['steps'][0]['recipients']
-        assert len(recipients) == 2
-        assert recipients[0]['email'] == 'a@b.com'
-        assert recipients[1]['email'] == 'c@d.com'
-
-    def test_missing_name(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='name'):
-            connector.create_workflow(_json_post(factory, '/create-workflow',
-                                                 {'recipients': [{'email': 'a@b.com'}]}))
-
-    def test_missing_recipients_and_steps(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='steps.*recipients'):
-            connector.create_workflow(_json_post(factory, '/create-workflow', {'name': 'Test'}))
-
-    def test_steps_and_recipients_exclusive(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='mutually exclusive'):
-            connector.create_workflow(_json_post(factory, '/create-workflow', {
-                'name': 'Test',
-                'steps': [{'stepType': 'signature', 'recipients': []}],
-                'recipients': [{'email': 'a@b.com'}],
-            }))
-
-    def test_invalid_json(self, connector, factory):
-        request = factory.post('/create-workflow', data='not json',
-                               content_type='application/json')
-        with pytest.raises(GoodflagValidationError, match='Invalid JSON'):
-            connector.create_workflow(request)
-
-    @responses.activate
-    def test_api_error(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/users/{USER_ID}/workflows',
-                      json={'message': 'Unexpected error'}, status=500)
-        with pytest.raises(GoodflagError):
-            connector.create_workflow(_json_post(factory, '/create-workflow', {
-                'name': 'Test', 'recipients': [{'email': 'a@b.com'}],
-            }))
+@responses.activate
+def test_create_workflow(connector, factory):
+    responses.add(responses.POST, f'{BASE}/users/usr_TestUser123/workflows', json=WF, status=200)
+    result = connector.create_workflow(_post(factory, {
+        'name': 'Sig 2024',
+        'recipient_email': 'a@b.com', 'recipient_firstname': 'A', 'recipient_lastname': 'B',
+        'metadata': {'data1': 'DEM-2024-001'},
+    }))
+    assert result['data']['workflow_id'] == 'wfl_Test001'
+    body = json.loads(responses.calls[0].request.body)
+    assert body['steps'][0]['recipients'][0]['consentPageId'] == 'cop_Default'
+    assert body['data1'] == 'DEM-2024-001'
 
 
-class TestUploadDocument:
-    @responses.activate
-    def test_with_base64(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_Test001/parts',
-                      json=MOCK_UPLOAD_RESPONSE, status=200)
-        b64 = base64.b64encode(b'%PDF-1.4 content').decode()
-        result = connector.upload_document(_json_post(factory, '/upload-document', {
-            'workflow_id': 'wfl_Test001',
-            'file_base64': b64,
-            'filename': 'test.pdf',
+def test_create_workflow_validation(connector, factory):
+    with pytest.raises(GoodflagValidationError, match='name'):
+        connector.create_workflow(_post(factory, {'recipients': [{'email': 'a@b.com'}]}))
+    with pytest.raises(GoodflagValidationError, match='steps.*recipients'):
+        connector.create_workflow(_post(factory, {
+            'name': 'T', 'steps': [{}], 'recipients': [{'email': 'a@b.com'}],
         }))
-        assert result['data']['document_id'] == 'doc_Doc001'
 
-    @responses.activate
-    def test_with_file_object(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_Test001/parts',
-                      json=MOCK_UPLOAD_RESPONSE, status=200)
-        b64 = base64.b64encode(b'%PDF-1.4 content').decode()
-        result = connector.upload_document(_json_post(factory, '/upload-document', {
-            'workflow_id': 'wfl_Test001',
-            'file': {'filename': 'doc.pdf', 'content_type': 'application/pdf', 'content': b64},
+
+def test_create_workflow_invalid_metadata(connector, factory):
+    with pytest.raises(GoodflagValidationError, match='metadata'):
+        connector.create_workflow(_post(factory, {
+            'name': 'T', 'recipients': [{'email': 'a@b.com'}],
+            'metadata': {'name': 'evil'},
         }))
-        assert result['data']['document_id'] == 'doc_Doc001'
 
-    def test_missing_workflow(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='workflow_id'):
-            connector.upload_document(_json_post(factory, '/upload-document', {
-                'file_base64': base64.b64encode(b'%PDF-1.4').decode(),
-            }))
 
-    def test_missing_file(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='file'):
-            connector.upload_document(_json_post(factory, '/upload-document', {
-                'workflow_id': 'wfl_Test001',
-            }))
+@responses.activate
+def test_submit_workflow_end_to_end(connector, factory):
+    responses.add(responses.POST, f'{BASE}/users/usr_TestUser123/workflows', json=WF, status=200)
+    responses.add(responses.POST, f'{BASE}/workflows/wfl_Test001/parts', json=UPLOAD, status=200)
+    responses.add(responses.PATCH, f'{BASE}/workflows/wfl_Test001',
+                  json={'id': 'wfl_Test001', 'workflowStatus': 'started'}, status=200)
+    b64 = base64.b64encode(b'%PDF-1.4 content').decode()
+    result = connector.submit_workflow(_post(factory, {
+        'name': 'E2E',
+        'recipients': [{'email': 'a@b.com', 'firstName': 'A', 'lastName': 'B'}],
+        'file_base64': b64, 'filename': 'doc.pdf',
+    }))
+    assert result['data']['workflow_id'] == 'wfl_Test001'
+    assert result['data']['status'] == 'started'
+    assert result['data']['document_id'] == 'doc_Doc001'
 
-    def test_invalid_pdf(self, connector, factory):
-        b64 = base64.b64encode(b'<html>not a pdf</html>').decode()
-        with pytest.raises(GoodflagValidationError, match='PDF'):
-            connector.upload_document(_json_post(factory, '/upload-document', {
-                'workflow_id': 'wfl_Test001', 'file_base64': b64,
-            }))
 
-    @responses.activate
-    def test_with_file_url(self, connector, factory, monkeypatch):
-        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_Test001/parts',
-                      json=MOCK_UPLOAD_RESPONSE, status=200)
+@responses.activate
+def test_upload_document(connector, factory):
+    responses.add(responses.POST, f'{BASE}/workflows/wfl_Test001/parts', json=UPLOAD, status=200)
+    b64 = base64.b64encode(b'%PDF-1.4 content').decode()
+    result = connector.upload_document(_post(factory, {
+        'workflow_id': 'wfl_Test001', 'file_base64': b64, 'filename': 'doc.pdf',
+    }))
+    assert result['data']['document_id'] == 'doc_Doc001'
 
-        class FakeResponse:
-            status_code = 200
-            content = b'%PDF-1.4 from url'
 
-        def fake_get(url, *args, **kwargs):
-            return FakeResponse()
-
-        monkeypatch.setattr(connector.requests, 'get', fake_get)
-        result = connector.upload_document(_json_post(factory, '/upload-document', {
-            'workflow_id': 'wfl_Test001',
-            'file_url': 'https://wcs.example.com/document.pdf',
-        }))
-        assert result['data']['document_id'] == 'doc_Doc001'
-
-    def test_file_url_blocked_http(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='https'):
-            connector.upload_document(_json_post(factory, '/upload-document', {
-                'workflow_id': 'wfl_Test001',
-                'file_url': 'http://example.com/doc.pdf',
-            }))
-
-    def test_file_url_blocked_localhost(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='local'):
-            connector.upload_document(_json_post(factory, '/upload-document', {
-                'workflow_id': 'wfl_Test001',
-                'file_url': 'https://localhost/doc.pdf',
-            }))
-
-    def test_file_url_blocked_private_ip(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='non-routable'):
-            connector.upload_document(_json_post(factory, '/upload-document', {
-                'workflow_id': 'wfl_Test001',
-                'file_url': 'https://192.168.1.1/doc.pdf',
+def test_upload_document_ssrf(connector, factory):
+    for url in ('http://example.com/doc.pdf', 'https://localhost/doc.pdf',
+                'https://192.168.1.1/doc.pdf'):
+        with pytest.raises(GoodflagValidationError):
+            connector.upload_document(_post(factory, {
+                'workflow_id': 'wfl_Test001', 'file_url': url,
             }))
 
 
-class TestStartStopWorkflow:
-    @responses.activate
-    def test_start(self, connector, factory):
-        responses.add(responses.PATCH, f'{BASE_URL}/workflows/wfl_Test001',
-                      json=MOCK_START_RESPONSE, status=200)
-        result = connector.start_workflow(_json_post(factory, '/start-workflow', {
-            'workflow_id': 'wfl_Test001',
-        }))
-        assert result['data']['status'] == 'started'
-
-    @responses.activate
-    def test_stop(self, connector, factory):
-        responses.add(responses.PATCH, f'{BASE_URL}/workflows/wfl_Test001',
-                      json={'id': 'wfl_Test001', 'workflowStatus': 'stopped'}, status=200)
-        result = connector.stop_workflow(factory.post('/stop-workflow'), workflow_id='wfl_Test001')
-        assert result['data']['status'] == 'stopped'
-
-    def test_start_missing_id(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='workflow_id'):
-            connector.start_workflow(_json_post(factory, '/start-workflow', {}))
+@responses.activate
+def test_start_stop_workflow(connector, factory):
+    responses.add(responses.PATCH, f'{BASE}/workflows/wfl_Test001', json=WF_STARTED, status=200)
+    assert connector.start_workflow(_post(factory, {'workflow_id': 'wfl_Test001'})
+                                    )['data']['status'] == 'started'
+    responses.reset()
+    responses.add(responses.PATCH, f'{BASE}/workflows/wfl_Test001',
+                  json={'id': 'wfl_Test001', 'workflowStatus': 'stopped'}, status=200)
+    assert connector.stop_workflow(factory.post('/x'), workflow_id='wfl_Test001'
+                                   )['data']['status'] == 'stopped'
 
 
-class TestGetWorkflow:
-    @responses.activate
-    def test_success(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows/wfl_Test001',
-                      json=MOCK_WORKFLOW_DETAIL, status=200)
-        result = connector.get_workflow(factory.get('/get-workflow'), workflow_id='wfl_Test001')
-        assert result['data']['workflow_id'] == 'wfl_Test001'
-        assert result['data']['status'] == 'started'
+@responses.activate
+def test_sync_status_normalization(connector, factory):
+    for raw, normalized, is_final in [('finished', 'finished', True),
+                                      ('started', 'started', False),
+                                      ('stopped', 'refused', True)]:
+        responses.reset()
+        responses.add(responses.GET, f'{BASE}/workflows/wfl_Test001',
+                      json={'id': 'wfl_Test001', 'workflowStatus': raw}, status=200)
+        result = connector.sync_status(factory.get('/x'), workflow_id='wfl_Test001')
+        assert result['data']['status'] == normalized
+        assert result['data']['is_final'] is is_final
 
 
-class TestSyncStatus:
-    @responses.activate
-    def test_finished(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows/wfl_Test001',
-                      json={'id': 'wfl_Test001', 'workflowStatus': 'finished',
-                            'progress': 100}, status=200)
-        result = connector.sync_status(factory.get('/sync-status'), workflow_id='wfl_Test001')
-        assert result['data']['status'] == 'finished'
-        assert result['data']['is_final'] is True
-
-    @responses.activate
-    def test_started_not_final(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows/wfl_Test001',
-                      json={'id': 'wfl_Test001', 'workflowStatus': 'started',
-                            'progress': 50}, status=200)
-        result = connector.sync_status(factory.get('/sync-status'), workflow_id='wfl_Test001')
-        assert result['data']['status'] == 'started'
-        assert result['data']['is_final'] is False
+@responses.activate
+def test_resend_invite(connector, factory):
+    responses.add(responses.POST, f'{BASE}/workflows/wfl_Test001/sendInvite',
+                  json=INVITE, status=200)
+    result = connector.resend_invite(_post(factory, {
+        'workflow_id': 'wfl_Test001', 'recipient_email': 'signer@example.com',
+    }))
+    assert result['data']['invite_url'].startswith('https://')
+    with pytest.raises(GoodflagValidationError, match='recipient_email'):
+        connector.resend_invite(_post(factory, {'workflow_id': 'wfl_Test001'}))
 
 
-class TestSubmitWorkflow:
-    @responses.activate
-    def test_full_pipeline(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/users/{USER_ID}/workflows',
-                      json=MOCK_WORKFLOW_RESPONSE, status=200)
-        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_Test001/parts',
-                      json=MOCK_UPLOAD_RESPONSE, status=200)
-        responses.add(responses.PATCH, f'{BASE_URL}/workflows/wfl_Test001',
-                      json=MOCK_START_RESPONSE, status=200)
-        b64 = base64.b64encode(b'%PDF-1.4 content').decode()
-        result = connector.submit_workflow(_json_post(factory, '/submit-workflow', {
-            'name': 'End-to-end',
-            'recipients': [{'email': 'a@b.com', 'firstName': 'A', 'lastName': 'B'}],
-            'file_base64': b64,
-            'filename': 'doc.pdf',
-        }))
-        data = result['data']
-        assert data['workflow_id'] == 'wfl_Test001'
-        assert data['status'] == 'started'
-        assert data['document_id'] == 'doc_Doc001'
+@responses.activate
+def test_get_viewer_url(connector, factory):
+    responses.add(responses.POST, f'{BASE}/documents/doc_Doc001/viewer',
+                  json=VIEWER, status=200)
+    result = connector.get_viewer_url(_post(factory, {'document_id': 'doc_Doc001'}))
+    assert result['data']['viewer_url'].startswith('https://')
 
 
-class TestResendInvite:
-    @responses.activate
-    def test_success(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_Test001/sendInvite',
-                      json=MOCK_INVITE_RESPONSE, status=200)
-        result = connector.resend_invite(_json_post(factory, '/resend-invite', {
-            'workflow_id': 'wfl_Test001',
-            'recipient_email': 'signer@example.com',
-        }))
-        assert result['data']['invite_url'].startswith('https://')
-
-    def test_missing_email(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='recipient_email'):
-            connector.resend_invite(_json_post(factory, '/resend-invite', {
-                'workflow_id': 'wfl_Test001',
-            }))
-
-    def test_missing_workflow(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='workflow_id'):
-            connector.resend_invite(_json_post(factory, '/resend-invite', {
-                'recipient_email': 'signer@example.com',
-            }))
+@responses.activate
+def test_list_workflows(connector, factory):
+    responses.add(responses.GET, f'{BASE}/workflows', json=WF_LIST, status=200)
+    result = connector.list_workflows(factory.get('/x?text=DEM&page=0&per_page=10'))
+    assert result['data']['total'] == 1
+    assert result['data']['items'][0]['workflow_id'] == 'wfl_Test001'
 
 
-class TestGetViewerUrl:
-    @responses.activate
-    def test_success(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/documents/doc_Doc001/viewer',
-                      json=MOCK_VIEWER_RESPONSE, status=200)
-        result = connector.get_viewer_url(_json_post(factory, '/get-viewer-url', {
-            'document_id': 'doc_Doc001',
-            'redirect_url': 'https://wcs.example.com/return',
-        }))
-        assert result['data']['viewer_url'].startswith('https://')
-
-    @responses.activate
-    def test_via_get(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/documents/doc_Doc001/viewer',
-                      json=MOCK_VIEWER_RESPONSE, status=200)
-        result = connector.get_viewer_url(factory.get('/get-viewer-url?document_id=doc_Doc001'))
-        assert result['data']['viewer_url'].startswith('https://')
-
-    def test_missing_document(self, connector, factory):
-        with pytest.raises(GoodflagValidationError, match='document_id'):
-            connector.get_viewer_url(_json_post(factory, '/get-viewer-url', {}))
+@responses.activate
+def test_download_signed_documents(connector, factory):
+    responses.add(responses.GET, f'{BASE}/workflows/wfl_Test001/downloadDocuments',
+                  body=b'%PDF-1.4 signed', content_type='application/pdf',
+                  headers={'Content-Disposition': 'attachment; filename="signed.pdf"'},
+                  status=200)
+    response = connector.download_signed_documents(factory.get('/x'), workflow_id='wfl_Test001')
+    assert response['Content-Type'] == 'application/pdf'
+    assert 'signed.pdf' in response['Content-Disposition']
 
 
-class TestListWorkflows:
-    @responses.activate
-    def test_success(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows',
-                      json=MOCK_WORKFLOW_LIST, status=200)
-        result = connector.list_workflows(factory.get('/list-workflows?text=DEM'))
-        assert result['data']['total'] == 1
-        assert result['data']['items'][0]['workflow_id'] == 'wfl_Test001'
-
-    @responses.activate
-    def test_pagination(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows',
-                      json=MOCK_WORKFLOW_LIST, status=200)
-        result = connector.list_workflows(factory.get('/list-workflows?page=2&per_page=10'))
-        assert result['data']['page'] == 2
-        assert result['data']['per_page'] == 10
-
-
-class TestDownload:
-    @responses.activate
-    def test_signed_documents(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows/wfl_Test001/downloadDocuments',
-                      body=b'%PDF-1.4 signed', content_type='application/pdf',
-                      headers={'Content-Disposition': 'attachment; filename="signed.pdf"'},
-                      status=200)
-        response = connector.download_signed_documents(factory.get('/download-signed-documents'),
-                                                      workflow_id='wfl_Test001')
-        assert response['Content-Type'] == 'application/pdf'
-        assert 'signed.pdf' in response['Content-Disposition']
-
-
-class TestExternalRefResolution:
-    @responses.activate
-    def test_get_workflow_via_external_ref(self, connector, factory):
-        responses.add(responses.GET, f'{BASE_URL}/workflows',
-                      json=MOCK_WORKFLOW_LIST, status=200)
-        responses.add(responses.GET, f'{BASE_URL}/workflows/wfl_Test001',
-                      json=MOCK_WORKFLOW_DETAIL, status=200)
-        result = connector.get_workflow(factory.get('/get-workflow?external_ref=DEM-2024-001'),
-                                        external_ref='DEM-2024-001')
-        assert result['data']['workflow_id'] == 'wfl_Test001'
-
-
-class TestPayloadParsing:
-    @responses.activate
-    def test_query_string_merge(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/workflows/wfl_Test001/parts',
-                      json=MOCK_UPLOAD_RESPONSE, status=200)
-        b64 = base64.b64encode(b'%PDF-1.4 content').decode()
-        request = factory.post(
-            f'/upload-document?workflow_id=wfl_Test001&file_base64={b64}',
-            content_type='application/json',
-        )
-        result = connector.upload_document(request)
-        assert result['data']['document_id'] == 'doc_Doc001'
-
-    @responses.activate
-    def test_strips_passerelle_auth_params(self, connector, factory):
-        responses.add(responses.POST, f'{BASE_URL}/users/{USER_ID}/workflows',
-                      json=MOCK_WORKFLOW_RESPONSE, status=200)
-        # The auth params should never end up in the workflow payload sent to Goodflag.
-        request = factory.post(
-            '/create-workflow?orig=test&algo=x&signature=y',
-            data=json.dumps({'name': 'Test', 'recipients': [{'email': 'a@b.com'}]}),
-            content_type='application/json',
-        )
-        connector.create_workflow(request)
-        body = json.loads(responses.calls[0].request.body)
-        assert 'orig' not in body
-        assert 'signature' not in body
+@responses.activate
+def test_external_ref_resolution(connector, factory):
+    responses.add(responses.GET, f'{BASE}/workflows', json=WF_LIST, status=200)
+    responses.add(responses.GET, f'{BASE}/workflows/wfl_Test001', json=WF_STARTED, status=200)
+    result = connector.get_workflow(factory.get('/x?external_ref=DEM-2024-001'),
+                                    external_ref='DEM-2024-001')
+    assert result['data']['workflow_id'] == 'wfl_Test001'

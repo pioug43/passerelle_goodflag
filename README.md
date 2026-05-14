@@ -182,7 +182,7 @@ Nom de variable : goodflag_status
 | Identifiant workflow Goodflag | Texte | `{{ form_var_goodflag_workflow_id }}` |
 | Statut signature Goodflag | Texte | `{{ form_var_goodflag_status }}` |
 
-### Multi-signataires
+### Multi-signataires (format indexé)
 
 ```bash
 curl -s -X POST .../submit-workflow \
@@ -200,6 +200,109 @@ curl -s -X POST .../submit-workflow \
     "file_url": "https://formulaires.example.com/convention/1/download?f=2"
   }'
 ```
+
+### Multi-étapes : valideur + signataires avec consent/profil spécifiques
+
+Cas d'usage : un responsable **valide** le document, puis deux signataires le **signent** avec authentification OTP SMS. Chaque étape a sa propre page de consentement et son profil de signature.
+
+```bash
+curl -s -X POST .../submit-workflow \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Convention recherche INSA-Industriel 2026",
+    "steps": [
+      {
+        "stepType": "approval",
+        "recipients": [
+          {
+            "email": "directeur.labo@insa-lyon.fr",
+            "firstName": "Marie",
+            "lastName": "Curie",
+            "consentPageId": "cop_ApprobationLaboINSA"
+          }
+        ],
+        "maxInvites": 3
+      },
+      {
+        "stepType": "signature",
+        "recipients": [
+          {
+            "email": "chercheur@insa-lyon.fr",
+            "firstName": "Pierre",
+            "lastName": "Martin",
+            "phoneNumber": "+33611111111",
+            "consentPageId": "cop_SignatureOTPSMS"
+          },
+          {
+            "email": "responsable@industriel.com",
+            "firstName": "Jean",
+            "lastName": "Dupont",
+            "phoneNumber": "+33622222222",
+            "consentPageId": "cop_SignatureOTPSMS"
+          }
+        ],
+        "maxInvites": 5
+      }
+    ],
+    "signature_profile_id": "sip_ProfilOTPSMS_INSA",
+    "layout_id": "lay_MetadataINSA",
+    "metadata": {
+      "data1": "{{ form_number }}",
+      "data2": "Convention recherche",
+      "data3": "Laboratoire CITI"
+    },
+    "file_url": "https://formulaires.insa.pbelledent.cloud/convention/1/download?f=2",
+    "content_type": "application/pdf"
+  }'
+```
+
+**Explication du circuit :**
+
+1. **Étape 1 — Approbation** (`stepType: approval`) :  
+   Le directeur de labo reçoit un email, visualise le document et approuve (pas de signature électronique, juste une validation). La page de consentement `cop_ApprobationLaboINSA` affiche les conditions d'approbation spécifiques.
+
+2. **Étape 2 — Signature** (`stepType: signature`) :  
+   Une fois l'approbation donnée, les deux signataires reçoivent simultanément une invitation. Chacun signe avec OTP SMS (code envoyé sur leur téléphone). La page `cop_SignatureOTPSMS` affiche les mentions légales de signature électronique.
+
+**Paramètres spécifiques :**
+
+| Paramètre | Niveau | Description |
+|-----------|--------|-------------|
+| `consentPageId` | par destinataire | Page de consentement (texte affiché avant signature/approbation). Surcharge `default_consent_page_id` du connecteur. |
+| `signature_profile_id` | par document | Profil de signature (type d'authentification : OTP SMS, certificat...). Surcharge `default_signature_profile_id` du connecteur. |
+| `layout_id` | par workflow | Layout pour les métadonnées (`data1`-`data16`). Surcharge `default_layout_id`. |
+| `maxInvites` | par étape | Nombre max de relances automatiques par destinataire. |
+
+### Même exemple en format WCS (webservice_call POST)
+
+Pour intégrer dans un workflow WCS sans JSON natif, utiliser les paramètres indexés :
+
+```
+URL : {{ passerelle_url }}passerelle-goodflag/signature/create-workflow
+Méthode : POST
+Paramètres POST :
+  name = Convention recherche {{ form_number }}
+
+  # Étape 1 : valideur (utiliser le format steps JSON dans le body)
+  # → Pour les workflows multi-étapes, passer le JSON complet via le champ
+  #   "steps" dans le body de la requête WCS (type: JSON)
+
+  # Alternative simple : 2 signataires sans étape d'approbation
+  recipients_0_email     = {{ form_var_email_chercheur }}
+  recipients_0_firstname = {{ form_var_prenom_chercheur }}
+  recipients_0_lastname  = {{ form_var_nom_chercheur }}
+  recipients_0_phone     = {{ form_var_tel_chercheur }}
+  recipients_0_consent_page_id = cop_SignatureOTPSMS
+  recipients_1_email     = {{ form_var_email_industriel }}
+  recipients_1_firstname = {{ form_var_prenom_industriel }}
+  recipients_1_lastname  = {{ form_var_nom_industriel }}
+  recipients_1_phone     = {{ form_var_tel_industriel }}
+  recipients_1_consent_page_id = cop_SignatureOTPSMS
+  signature_profile_id   = sip_ProfilOTPSMS_INSA
+  external_ref           = {{ form_number }}
+```
+
+> **Note** : le format indexé (`recipients_N_consent_page_id`) permet de surcharger la page de consentement **par destinataire** directement depuis les paramètres WCS, sans passer par le JSON `steps`.
 
 ### Recherche et supervision
 

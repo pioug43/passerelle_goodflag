@@ -63,8 +63,10 @@ class GoodflagClient:
         url = self._url(path)
         kwargs = dict(
             json=json_data, params=params, data=data,
-            headers=headers, timeout=self.timeout, stream=stream,
+            timeout=self.timeout, stream=stream,
         )
+        if headers:
+            kwargs['headers'] = headers
         if cache_duration and method.upper() == 'GET':
             kwargs['cache_duration'] = cache_duration
         response = self.session.request(method=method, url=url, **kwargs)

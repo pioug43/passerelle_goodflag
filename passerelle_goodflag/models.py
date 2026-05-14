@@ -341,17 +341,18 @@ class GoodflagResource(BaseResource):
 
     def make_requests_auth(self, session):
         from requests.auth import AuthBase
+        from urllib.parse import urlparse
+
+        resource = self
 
         class BearerAuth(AuthBase):
-            def __init__(self, token):
-                self.token = token
-
             def __call__(self, r):
-                r.headers['Authorization'] = f'Bearer {self.token}'
-                r.headers['Accept'] = 'application/json'
+                if urlparse(r.url).netloc == urlparse(resource.base_url).netloc:
+                    r.headers['Authorization'] = f'Bearer {resource.access_token}'
+                    r.headers['Accept'] = 'application/json'
                 return r
 
-        return BearerAuth(self.access_token)
+        return BearerAuth()
 
     def _get_client(self):
         return GoodflagClient(

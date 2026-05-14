@@ -75,7 +75,8 @@ class GoodflagClient:
             return response
         if response.status_code == 204:
             return {}
-        if 'application/json' not in response.headers.get('Content-Type', ''):
+        ct = response.headers.get('Content-Type') or ''
+        if 'application/json' not in ct:
             return {'raw_text': response.text}
         try:
             data = response.json()

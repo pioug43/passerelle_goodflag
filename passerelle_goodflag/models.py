@@ -327,15 +327,23 @@ class GoodflagResource(BaseResource):
         payload.update({k: v for k, v in kwargs.items() if v is not None})
         return payload
 
+    def make_requests_auth(self, session):
+        from requests.auth import AuthBase
+
+        class BearerAuth(AuthBase):
+            def __init__(self, token):
+                self.token = token
+
+            def __call__(self, r):
+                r.headers['Authorization'] = f'Bearer {self.token}'
+                r.headers['Accept'] = 'application/json'
+                return r
+
+        return BearerAuth(self.access_token)
+
     def _get_client(self):
-        session = self.requests
-        session.headers.update({
-            'Authorization': f'Bearer {self.access_token}',
-            'Accept': 'application/json',
-        })
-        session.verify = self.verify_ssl
         return GoodflagClient(
-            session=session,
+            session=self.requests,
             base_url=self.base_url,
             user_id=self.user_id,
             timeout=self.timeout,

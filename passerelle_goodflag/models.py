@@ -1,4 +1,5 @@
 import base64
+import binascii
 import io
 import ipaddress
 import json
@@ -227,7 +228,10 @@ def _extract_file(payload, request, session):
             raise APIError("'content' is missing in 'file' object", http_status=400)
         if len(b64) > MAX_B64_LEN:
             raise APIError("File content exceeds maximum allowed size (50 MB)", http_status=400)
-        content = base64.b64decode(b64)
+        try:
+            content = base64.b64decode(b64)
+        except (ValueError, binascii.Error):
+            raise APIError("Invalid base64 content in 'file.content'", http_status=400)
         filename = filename or file_obj.get('filename')
         content_type = file_obj.get('content_type') or content_type
     elif request.FILES.get('file'):
@@ -238,7 +242,10 @@ def _extract_file(payload, request, session):
         b64 = _get_param(payload, 'file_base64')
         if len(b64) > MAX_B64_LEN:
             raise APIError("File content exceeds maximum allowed size (50 MB)", http_status=400)
-        content = base64.b64decode(b64)
+        try:
+            content = base64.b64decode(b64)
+        except (ValueError, binascii.Error):
+            raise APIError("Invalid base64 in 'file_base64'", http_status=400)
     elif _get_param(payload, 'file_url'):
         file_url = _get_param(payload, 'file_url')
         _validate_file_url(file_url)

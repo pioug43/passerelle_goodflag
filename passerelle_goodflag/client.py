@@ -147,7 +147,13 @@ class GoodflagClient:
                 http_status=400,
             )
         if isinstance(file_content, (str, memoryview)):
-            file_content = base64.b64decode(file_content) if isinstance(file_content, str) else bytes(file_content)
+            if isinstance(file_content, str):
+                try:
+                    file_content = base64.b64decode(file_content)
+                except (ValueError, Exception):
+                    raise APIError("Invalid base64 file content", http_status=400)
+            else:
+                file_content = bytes(file_content)
         if len(file_content) > MAX_UPLOAD_SIZE:
             raise APIError(f"File too large ({len(file_content)} bytes). Max: {MAX_UPLOAD_SIZE}", http_status=400)
 

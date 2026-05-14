@@ -118,7 +118,17 @@ def _build_workflow_payload(payload, resource):
         raise APIError("Configuration error: 'user_id' is missing in the connector settings.", http_status=500)
 
     steps_config = payload.get('steps')
+    if isinstance(steps_config, str):
+        try:
+            steps_config = json.loads(steps_config)
+        except (ValueError, TypeError):
+            raise APIError("'steps' must be valid JSON", http_status=400)
     recipients = payload.get('recipients')
+    if isinstance(recipients, str):
+        try:
+            recipients = json.loads(recipients)
+        except (ValueError, TypeError):
+            raise APIError("'recipients' must be valid JSON", http_status=400)
     if steps_config and recipients:
         raise APIError("'steps' and 'recipients' are mutually exclusive.", http_status=400)
 

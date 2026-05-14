@@ -22,3 +22,6 @@ INVITE = {'inviteUrl': 'https://goodflag.test/invite?t=eyJ'}
 VIEWER = {'viewerUrl': 'https://goodflag.test/viewer?t=eyJ'}
 WF_LIST = {'items': [{'id': 'wfl_Test001', 'name': 'T', 'workflowStatus': 'draft',
                       'data1': 'DEM-2024-001'}], 'totalItems': 1}
+WF_MULTI = {'id': 'wfl_Multi001', 'workflowStatus': 'draft', 'name': 'Multi-step'}
+WF_MULTI_STARTED = {'id': 'wfl_Multi001', 'workflowStatus': 'started', 'progress': 0}
+UPLOAD_MULTI = {'documents': [{'id': 'doc_Multi001'}], 'parts': []}

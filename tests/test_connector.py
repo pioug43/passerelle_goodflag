@@ -9,7 +9,9 @@ from django.test import RequestFactory
 
 from passerelle_goodflag.exceptions import GoodflagError, GoodflagValidationError
 
-from .conftest import INVITE, UPLOAD, VIEWER, WF, WF_LIST, WF_STARTED
+from .conftest import (
+    INVITE, UPLOAD, UPLOAD_MULTI, VIEWER, WF, WF_LIST, WF_MULTI, WF_MULTI_STARTED, WF_STARTED,
+)
 
 pytestmark = pytest.mark.django_db
 BASE = 'https://api.goodflag.test/api'

@@ -14,13 +14,13 @@ from passerelle.base.models import BaseResource
 from passerelle.utils.api import endpoint
 from passerelle.utils.jsonresponse import APIError
 
-from .client import MAX_UPLOAD_SIZE, GoodflagClient
+from .client import (
+    MAX_B64_LEN, MAX_RECIPIENTS, MAX_UPLOAD_SIZE,
+    FILE_URL_CHUNK, FILE_URL_TIMEOUT,
+    GoodflagClient,
+)
 
 _PASSERELLE_AUTH_PARAMS = frozenset({'orig', 'algo', 'timestamp', 'nonce', 'signature'})
-_MAX_RECIPIENTS = 100
-_FILE_URL_TIMEOUT = 30
-_FILE_URL_CHUNK = 64 * 1024
-MAX_B64_LEN = int(MAX_UPLOAD_SIZE * 4 / 3) + 1024
 
 
 def _get_param(payload, key, default=None):
@@ -93,7 +93,7 @@ def _validate_file_content(content, content_type):
 
 def _parse_recipients(payload):
     recipients = []
-    for i in range(_MAX_RECIPIENTS):
+    for i in range(MAX_RECIPIENTS):
         email = _get_param(payload, f'recipients_{i}_email')
         if not email:
             break
@@ -213,13 +213,13 @@ def _extract_file(payload, request, session):
     elif _get_param(payload, 'file_url'):
         file_url = _get_param(payload, 'file_url')
         _validate_file_url(file_url)
-        resp = session.get(file_url, stream=True, timeout=_FILE_URL_TIMEOUT)
+        resp = session.get(file_url, stream=True, timeout=FILE_URL_TIMEOUT)
         if resp.status_code != 200:
             resp.close()
             raise APIError(f"Failed to fetch file from URL: HTTP {resp.status_code}", http_status=502)
         buf = bytearray()
         try:
-            for chunk in resp.iter_content(chunk_size=_FILE_URL_CHUNK):
+            for chunk in resp.iter_content(chunk_size=FILE_URL_CHUNK):
                 if not chunk:
                     continue
                 buf.extend(chunk)
@@ -248,7 +248,9 @@ def _download_response(result):
         resp.iter_content(chunk_size=8192),
         content_type=result['content_type'],
     )
-    streaming['Content-Disposition'] = f'attachment; filename="{result["filename"]}"'
+    from .client import _sanitize_filename
+    safe_name = _sanitize_filename(result['filename'])
+    streaming['Content-Disposition'] = f'attachment; filename="{safe_name}"'
     return streaming
 
 
@@ -378,8 +380,6 @@ class GoodflagResource(BaseResource):
             return None
         for wf in search.get('items', []):
             if any(wf.get(f'data{i}') == external_ref for i in range(1, 17)):
-                return wf.get('id')
-            if external_ref in (wf.get('name') or ''):
                 return wf.get('id')
         return None
 

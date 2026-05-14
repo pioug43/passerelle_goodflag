@@ -8,7 +8,11 @@ from passerelle.utils.jsonresponse import APIError
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+MAX_B64_LEN = int(MAX_UPLOAD_SIZE * 4 / 3) + 1024
 MAX_METADATA_SLOTS = 16
+MAX_RECIPIENTS = 100
+FILE_URL_TIMEOUT = 30
+FILE_URL_CHUNK = 64 * 1024
 
 ALLOWED_CONTENT_TYPES = (
     'application/pdf',

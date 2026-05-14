@@ -22,6 +22,35 @@ from .client import (
 
 _PASSERELLE_AUTH_PARAMS = frozenset({'orig', 'algo', 'timestamp', 'nonce', 'signature'})
 
+SUBMIT_WORKFLOW_SCHEMA = {
+    'type': 'object',
+    'unflatten': True,
+    'required': ['name'],
+    'properties': {
+        'name': {'type': 'string', 'description': 'Nom/objet du workflow'},
+        'recipient_email': {'type': 'string', 'description': 'Email signataire (format simple)'},
+        'recipient_firstname': {'type': 'string', 'description': 'Prénom'},
+        'recipient_lastname': {'type': 'string', 'description': 'Nom'},
+        'recipient_phone': {'type': 'string', 'description': 'Téléphone OTP SMS (+33...)'},
+        'file': {
+            'type': 'object',
+            'description': 'Fichier (JSON)',
+            'properties': {
+                'filename': {'type': 'string'},
+                'content_type': {'type': 'string'},
+                'content': {'type': 'string', 'description': 'Contenu base64'},
+            },
+        },
+        'file_url': {'type': 'string', 'description': 'URL HTTPS du document'},
+        'file_base64': {'type': 'string', 'description': 'Document base64 (alt)'},
+        'filename': {'type': 'string'},
+        'content_type': {'type': 'string'},
+        'signature_profile_id': {'type': 'string', 'description': 'sip_xxx'},
+        'external_ref': {'type': 'string', 'description': 'Référence Publik'},
+        'steps': {'type': 'string', 'description': 'JSON multi-étapes (alt recipients)'},
+    },
+}
+
 
 def _get_param(payload, key, default=None):
     val = payload.get(key, default)
@@ -287,6 +316,7 @@ class GoodflagResource(BaseResource):
     )
 
     category = _('Connecteurs métiers')
+    hide_description_fields = ['access_token']
 
     class Meta:
         verbose_name = _('Connecteur Goodflag (signature électronique)')
@@ -436,8 +466,8 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='submit-workflow', perm='can_access', methods=['post'],
-        description=_('Crée + uploade + démarre un workflow en un seul appel (PDF/DOCX/image).'
-            'et démarre les invitations.'),
+        post={'request_body': {'schema': {'application/json': SUBMIT_WORKFLOW_SCHEMA}}},
+        description=_('Crée + uploade + démarre un workflow en un seul appel (PDF/DOCX/image).'),
         long_description=_(
 'Exemple requête JSON :\n'
             '{"name": "Convention de stage 2026", '

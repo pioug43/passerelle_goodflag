@@ -3,9 +3,7 @@ import logging
 import re
 from urllib.parse import unquote
 
-import requests
-
-from .exceptions import GoodflagAuthError, GoodflagError, GoodflagValidationError
+from passerelle.utils.jsonresponse import APIError
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +22,6 @@ STATUS_MAP = {
     'draft': 'draft',
     'started': 'started',
     'stopped': 'refused',
-    # archived = finished + archivé côté Goodflag, traité comme terminal côté W.C.S.
     'finished': 'finished',
     'archived': 'finished',
 }
@@ -45,38 +42,35 @@ def _parse_content_disposition_filename(header, default):
     return default
 
 
+def _sanitize_filename(name):
+    return (name or 'document.pdf').replace('\r', '').replace('\n', '').replace('"', "'")
+
+
 class GoodflagClient:
-    def __init__(self, base_url, access_token, timeout=30, verify_ssl=True):
-        if not base_url:
-            raise GoodflagValidationError("base_url is required")
-        if not access_token:
-            raise GoodflagValidationError("access_token is required")
+    """Thin wrapper around Passerelle's managed requests session for the Goodflag API."""
+
+    def __init__(self, session, base_url, user_id, timeout=30):
+        self.session = session
         self.base_url = base_url.rstrip('/')
+        self.user_id = user_id
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({
-            'Authorization': f'Bearer {access_token}',
-            'Accept': 'application/json',
-        })
-        self.session.verify = verify_ssl
 
     def _url(self, path):
         return f'{self.base_url}/{path.lstrip("/")}'
 
     def _request(self, method, path, json_data=None, params=None, data=None,
-                 headers=None, stream=False):
+                 headers=None, stream=False, cache_duration=None):
         url = self._url(path)
-        try:
-            response = self.session.request(
-                method=method, url=url, json=json_data, params=params,
-                data=data, headers=headers, timeout=self.timeout, stream=stream,
-            )
-        except requests.exceptions.RequestException as exc:
-            raise GoodflagError(f"HTTP error calling {method} {url}: {exc}")
+        kwargs = dict(
+            json=json_data, params=params, data=data,
+            headers=headers, timeout=self.timeout, stream=stream,
+        )
+        if cache_duration and method.upper() == 'GET':
+            kwargs['cache_duration'] = cache_duration
+        response = self.session.request(method=method, url=url, **kwargs)
 
         if response.status_code >= 400:
             self._raise_for_status(response)
-
         if stream:
             return response
         if response.status_code == 204:
@@ -86,8 +80,8 @@ class GoodflagClient:
         try:
             data = response.json()
         except ValueError:
-            raise GoodflagError(f"Invalid JSON in response (HTTP {response.status_code})",
-                                status_code=response.status_code)
+            raise APIError(f"Invalid JSON in response (HTTP {response.status_code})",
+                           http_status=502)
         if isinstance(data, str):
             return {'version': data}
         return data
@@ -100,24 +94,20 @@ class GoodflagClient:
         except ValueError:
             error_data = {'raw': response.text[:500]}
         error_msg = error_data.get('message') or error_data.get('error') or str(error_data)
-        logger.warning("Goodflag API error: HTTP %s - %s", response.status_code, error_msg)
-        if response.status_code in (401, 403):
-            raise GoodflagAuthError(f"Authentication failed: {error_msg}",
-                                    status_code=response.status_code, response_data=error_data)
-        if response.status_code in (400, 404, 422):
-            raise GoodflagValidationError(f"API error: {error_msg}",
-                                          status_code=response.status_code, response_data=error_data)
-        raise GoodflagError(f"API error (HTTP {response.status_code}): {error_msg}",
-                            status_code=response.status_code, response_data=error_data)
+        status = response.status_code
+        if status in (401, 403):
+            raise APIError(f"Authentication failed: {error_msg}", http_status=status)
+        if status in (400, 422):
+            raise APIError(f"Validation error: {error_msg}", http_status=status, data=error_data)
+        if status == 404:
+            raise APIError(f"Not found: {error_msg}", http_status=404)
+        raise APIError(f"Goodflag API error (HTTP {status}): {error_msg}", http_status=502)
 
     def test_connection(self):
-        try:
-            data = self._request('GET', '/version')
-            return {'status': 'ok', 'version': data.get('version', str(data))}
-        except GoodflagError as exc:
-            return {'status': 'error', 'message': str(exc)}
+        data = self._request('GET', '/version')
+        return {'status': 'ok', 'version': data.get('version', str(data))}
 
-    def create_workflow(self, user_id, name, steps, layout_id=None, metadata=None,
+    def create_workflow(self, name, steps, layout_id=None, metadata=None,
                         workflow_mode='FULL', description=None):
         payload = {'name': name, 'steps': steps, 'workflowMode': workflow_mode}
         if description:
@@ -128,32 +118,31 @@ class GoodflagClient:
             valid_keys = {f'data{i}' for i in range(1, MAX_METADATA_SLOTS + 1)}
             invalid = set(metadata) - valid_keys
             if invalid:
-                raise GoodflagValidationError(
+                raise APIError(
                     f"Invalid metadata keys: {', '.join(sorted(invalid))}. "
-                    f"Only data1 to data{MAX_METADATA_SLOTS} are allowed."
+                    f"Only data1 to data{MAX_METADATA_SLOTS} are allowed.",
+                    http_status=400,
                 )
             for key, value in metadata.items():
                 payload[key] = str(value)
-        data = self._request('POST', f'/users/{user_id}/workflows', json_data=payload)
+        data = self._request('POST', f'/users/{self.user_id}/workflows', json_data=payload)
         return {
             'workflow_id': data.get('id', ''),
             'status': data.get('workflowStatus', 'draft'),
-            'raw': data,
         }
 
     def upload_document(self, workflow_id, file_content, filename,
                         content_type='application/pdf', signature_profile_id=None):
         if content_type not in ALLOWED_CONTENT_TYPES:
-            raise GoodflagValidationError(
+            raise APIError(
                 f"Content type '{content_type}' not allowed. "
-                f"Allowed: {', '.join(ALLOWED_CONTENT_TYPES)}"
+                f"Allowed: {', '.join(ALLOWED_CONTENT_TYPES)}",
+                http_status=400,
             )
-        if isinstance(file_content, str):
-            file_content = base64.b64decode(file_content)
+        if isinstance(file_content, (str, memoryview)):
+            file_content = base64.b64decode(file_content) if isinstance(file_content, str) else bytes(file_content)
         if len(file_content) > MAX_UPLOAD_SIZE:
-            raise GoodflagValidationError(
-                f"File too large ({len(file_content)} bytes). Max: {MAX_UPLOAD_SIZE} bytes"
-            )
+            raise APIError(f"File too large ({len(file_content)} bytes). Max: {MAX_UPLOAD_SIZE}", http_status=400)
 
         params = {'createDocuments': 'true'}
         if signature_profile_id:
@@ -161,9 +150,7 @@ class GoodflagClient:
         if content_type != 'application/pdf':
             params['convertToPdf'] = 'true'
 
-        # CRLF protection on filename — would otherwise allow header injection
-        # via Content-Disposition through the Goodflag Apache proxy.
-        safe_filename = (filename or 'document.pdf').replace('\r', '').replace('\n', '').replace('"', "'")
+        safe_filename = _sanitize_filename(filename)
         headers = {
             'Content-Disposition': f'attachment; filename="{safe_filename}"',
             'Content-Type': content_type,
@@ -175,8 +162,6 @@ class GoodflagClient:
             'document_id': documents[0].get('id', '') if documents else '',
             'workflow_id': workflow_id,
             'filename': filename,
-            'documents': documents,
-            'parts': data.get('parts', []),
         }
 
     def patch_workflow_status(self, workflow_id, status):
@@ -187,8 +172,8 @@ class GoodflagClient:
             'status': data.get('workflowStatus', status),
         }
 
-    def get_workflow(self, workflow_id):
-        data = self._request('GET', f'/workflows/{workflow_id}')
+    def get_workflow(self, workflow_id, cache_duration=None):
+        data = self._request('GET', f'/workflows/{workflow_id}', cache_duration=cache_duration)
         raw_status = data.get('workflowStatus', 'draft')
         return {
             'workflow_id': data.get('id', workflow_id),
@@ -197,18 +182,14 @@ class GoodflagClient:
             'name': data.get('name'),
             'progress': data.get('progress', 0),
             'steps': data.get('steps', []),
-            'raw': data,
         }
 
     def send_invite(self, workflow_id, recipient_email):
-        data = self._request(
-            'POST', f'/workflows/{workflow_id}/sendInvite',
-            json_data={'recipientEmail': recipient_email},
-        )
+        data = self._request('POST', f'/workflows/{workflow_id}/sendInvite',
+                             json_data={'recipientEmail': recipient_email})
         return {
             'invite_url': data.get('inviteUrl', ''),
             'workflow_id': workflow_id,
-            'recipient_email': recipient_email,
         }
 
     def get_document_viewer_url(self, document_id, redirect_url=None, expired=None):
@@ -220,7 +201,6 @@ class GoodflagClient:
         data = self._request('POST', f'/documents/{document_id}/viewer', json_data=payload)
         return {
             'viewer_url': data.get('viewerUrl', ''),
-            'expired': data.get('expired'),
             'document_id': document_id,
         }
 
@@ -229,12 +209,12 @@ class GoodflagClient:
         return {
             'response': response,
             'content_type': response.headers.get('Content-Type', 'application/octet-stream'),
-            'filename': _parse_content_disposition_filename(
+            'filename': _sanitize_filename(_parse_content_disposition_filename(
                 response.headers.get('Content-Disposition', ''), 'signed_documents',
-            ),
+            )),
         }
 
-    def search_workflows(self, text=None, items_per_page=50, page_index=0):
+    def search_workflows(self, text=None, items_per_page=50, page_index=0, cache_duration=None):
         params = {
             'itemsPerPage': items_per_page,
             'pageIndex': page_index,
@@ -243,4 +223,4 @@ class GoodflagClient:
         }
         if text:
             params['text'] = text
-        return self._request('GET', '/workflows', params=params)
+        return self._request('GET', '/workflows', params=params, cache_duration=cache_duration)

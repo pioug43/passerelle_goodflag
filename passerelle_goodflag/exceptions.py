@@ -1,13 +1,6 @@
-class GoodflagError(Exception):
-    def __init__(self, message, status_code=None, response_data=None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.response_data = response_data
+# Kept for backwards compatibility — new code should use passerelle.utils.jsonresponse.APIError
+from passerelle.utils.jsonresponse import APIError
 
-
-class GoodflagAuthError(GoodflagError):
-    pass
-
-
-class GoodflagValidationError(GoodflagError):
-    pass
+GoodflagError = APIError
+GoodflagAuthError = APIError
+GoodflagValidationError = APIError

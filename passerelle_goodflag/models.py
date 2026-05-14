@@ -388,10 +388,17 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='create-workflow', perm='can_access', methods=['post'],
-        description=_('Crée un workflow de signature Goodflag (statut draft, sans document).'),
+        description=_('Crée un workflow de signature Goodflag (statut draft, sans document). '
+                      'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "draft"}}'),
         parameters={
-            'name': {'description': 'Nom/objet du workflow', 'example_value': 'Convention de stage 2026'},
-            'recipient_email': {'description': 'Email du signataire'},
+            'name': {'description': 'Nom/objet du workflow (obligatoire)', 'example_value': 'Convention de stage 2026-001'},
+            'recipient_email': {'description': 'Email du signataire (format simple)', 'example_value': 'signataire@example.com'},
+            'recipient_firstname': {'description': 'Prénom du signataire', 'example_value': 'Jean'},
+            'recipient_lastname': {'description': 'Nom du signataire', 'example_value': 'Dupont'},
+            'recipient_phone': {'description': 'Téléphone pour OTP SMS (format international)', 'example_value': '+33612345678'},
+            'workflow_mode': {'description': 'Mode du workflow : FULL (défaut) ou LIGHT', 'example_value': 'FULL'},
+            'description': {'description': 'Description libre du workflow'},
+            'external_ref': {'description': 'Référence externe (ex: numéro de demande Publik)', 'example_value': '81-1'},
         },
     )
     def create_workflow(self, request, **kwargs):
@@ -408,13 +415,21 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='submit-workflow', perm='can_access', methods=['post'],
-        description=_('Crée, uploade le document et démarre un workflow en un seul appel.'),
+        description=_('Pipeline complet en un appel : crée le workflow, uploade le document (PDF/DOCX/image) '
+                      'et démarre les invitations. '
+                      'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "started", "document_id": "doc_xxx"}}'),
         parameters={
-            'name': {'description': 'Nom/objet du workflow', 'example_value': 'Convention de stage'},
-            'recipient_email': {'description': 'Email du signataire'},
-            'recipient_firstname': {'description': 'Prénom du signataire'},
-            'recipient_lastname': {'description': 'Nom du signataire'},
-            'recipient_phone': {'description': 'Téléphone (OTP SMS)', 'example_value': '+33612345678'},
+            'name': {'description': 'Nom/objet du workflow (obligatoire)', 'example_value': 'Convention de stage 2026'},
+            'recipient_email': {'description': 'Email du signataire', 'example_value': 'signataire@example.com'},
+            'recipient_firstname': {'description': 'Prénom du signataire', 'example_value': 'Jean'},
+            'recipient_lastname': {'description': 'Nom du signataire', 'example_value': 'Dupont'},
+            'recipient_phone': {'description': 'Téléphone pour OTP SMS', 'example_value': '+33612345678'},
+            'file_url': {'description': 'URL HTTPS du document (récupéré côté Passerelle)', 'example_value': 'https://formulaires.example.com/demande/42/download?f=2'},
+            'file_base64': {'description': 'Document encodé en base64 (alternative à file_url)'},
+            'filename': {'description': 'Nom du fichier', 'example_value': 'convention.pdf'},
+            'content_type': {'description': 'Type MIME : application/pdf, DOCX, image/jpeg, image/png', 'example_value': 'application/pdf'},
+            'signature_profile_id': {'description': 'Profil de signature (surcharge le défaut)', 'example_value': 'sip_xxx'},
+            'external_ref': {'description': 'Référence externe Publik', 'example_value': '{{ form_number }}'},
         },
     )
     def submit_workflow(self, request, **kwargs):
@@ -447,8 +462,16 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='upload-document', perm='can_access', methods=['post'],
-        description=_('Upload un document dans un workflow Goodflag existant.'),
-        parameters={'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'}},
+        description=_('Upload un document (PDF, DOCX, JPEG, PNG, WebP) dans un workflow existant en draft. '
+                      'Taille max : 50 Mo. Les DOCX sont convertis en PDF côté Goodflag.'),
+        parameters={
+            'workflow_id': {'description': 'ID du workflow Goodflag (ou external_ref)', 'example_value': 'wfl_xxx'},
+            'file_url': {'description': 'URL HTTPS du document Publik', 'example_value': 'https://formulaires.example.com/demande/42/download?f=2'},
+            'file_base64': {'description': 'Document encodé en base64 (alternative à file_url)'},
+            'filename': {'description': 'Nom du fichier', 'example_value': 'document.pdf'},
+            'content_type': {'description': 'Type MIME du document', 'example_value': 'application/pdf'},
+            'signature_profile_id': {'description': 'Profil de signature (surcharge le défaut)', 'example_value': 'sip_xxx'},
+        },
     )
     def upload_document(self, request, **kwargs):
         payload = self._parse_payload(request, **kwargs)
@@ -464,8 +487,12 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='start-workflow', perm='can_access', methods=['post'],
-        description=_('Démarre un workflow Goodflag (envoie les invitations).'),
-        parameters={'workflow_id': {'description': 'ID du workflow'}},
+        description=_('Démarre un workflow en draft → envoie les invitations email aux signataires. '
+                      'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "started"}}'),
+        parameters={
+            'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
+            'external_ref': {'description': 'Ou référence externe (alternative à workflow_id)', 'example_value': '81-1'},
+        },
     )
     def start_workflow(self, request, **kwargs):
         workflow_id = self._require_workflow_id(self._parse_payload(request, **kwargs))
@@ -473,8 +500,12 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='stop-workflow', perm='can_access', methods=['post'],
-        description=_('Arrête un workflow Goodflag.'),
-        parameters={'workflow_id': {'description': 'ID du workflow'}},
+        description=_('Arrête un workflow en cours. Le statut passe à "stopped" (normalisé : "refused"). '
+                      'Les invitations en attente sont annulées.'),
+        parameters={
+            'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
+            'external_ref': {'description': 'Ou référence externe', 'example_value': '81-1'},
+        },
     )
     def stop_workflow(self, request, **kwargs):
         workflow_id = self._require_workflow_id(self._parse_payload(request, **kwargs))
@@ -482,8 +513,12 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='resend-invite', perm='can_access', methods=['post'],
-        description=_('Renvoie une invitation par email à un destinataire d\'un workflow.'),
-        parameters={'workflow_id': {'description': 'ID du workflow'}, 'recipient_email': {'description': 'Email'}},
+        description=_('Renvoie une invitation par email à un destinataire (relance). '
+                      'Utile si le signataire n\'a pas reçu ou a perdu l\'email initial.'),
+        parameters={
+            'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
+            'recipient_email': {'description': 'Email du destinataire à relancer (obligatoire)', 'example_value': 'signataire@example.com'},
+        },
     )
     def resend_invite(self, request, **kwargs):
         payload = self._parse_payload(request, **kwargs)
@@ -495,10 +530,12 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='sync-status', perm='can_access', methods=['get'],
-        description=_('Statut normalisé d\'un workflow (draft, started, finished, refused, error).'),
+        description=_('Statut normalisé pour polling WCS. Statuts : draft, started, finished, refused, error. '
+                      'is_final=true quand finished ou refused. Cache 10s pour limiter le polling. '
+                      'Réponse : {"data": {"workflow_id":"...", "status":"started", "progress":50, "is_final":false}}'),
         parameters={
             'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
-            'external_ref': {'description': 'Référence externe (alternative à workflow_id)'},
+            'external_ref': {'description': 'Référence externe Publik (alternative à workflow_id)', 'example_value': '81-1'},
         },
     )
     def sync_status(self, request, **kwargs):
@@ -515,11 +552,12 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='list-workflows', perm='can_access', methods=['get'],
-        description=_('Liste/recherche les workflows Goodflag.'),
+        description=_('Liste et recherche les workflows Goodflag (pagination, tri par date décroissante). '
+                      'Cache 15s. Réponse : {"data": {"total":42, "items":[{"workflow_id":"...", "name":"...", "status":"..."}]}}'),
         parameters={
-            'text': {'description': 'Recherche textuelle'},
-            'page': {'description': 'Numéro de page (0-indexed)', 'example_value': '0'},
-            'per_page': {'description': 'Résultats par page (max 100)', 'example_value': '50'},
+            'text': {'description': 'Recherche texte sur nom et métadonnées', 'example_value': 'Convention stage'},
+            'page': {'description': 'Index de page (0-based, défaut: 0)', 'example_value': '0'},
+            'per_page': {'description': 'Résultats par page (défaut: 50, max: 100)', 'example_value': '50'},
         },
     )
     def list_workflows(self, request, **kwargs):
@@ -546,8 +584,12 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='get-workflow', perm='can_access', methods=['get'],
-        description=_('Récupère le détail d\'un workflow Goodflag.'),
-        parameters={'workflow_id': {'description': 'ID du workflow', 'example_value': 'wfl_xxx'}},
+        description=_('Détail complet d\'un workflow : statut brut Goodflag, étapes, destinataires, progression. '
+                      'Réponse : {"data": {"workflow_id":"...", "status":"...", "normalized_status":"...", "steps":[...]}}'),
+        parameters={
+            'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
+            'external_ref': {'description': 'Ou référence externe Publik', 'example_value': '81-1'},
+        },
     )
     def get_workflow(self, request, **kwargs):
         workflow_id = self._require_workflow_id(self._parse_payload(request, **kwargs))
@@ -555,8 +597,13 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='get-viewer-url', perm='can_access', methods=['get', 'post'],
-        description=_('Génère une URL de visualisation pour un document Goodflag.'),
-        parameters={'document_id': {'description': 'ID du document', 'example_value': 'doc_xxx'}},
+        description=_('Génère une URL temporaire de visualisation d\'un document dans le navigateur '
+                      '(lecture seule, pas de signature). Réponse : {"data": {"viewer_url": "https://..."}}'),
+        parameters={
+            'document_id': {'description': 'ID du document Goodflag (obligatoire)', 'example_value': 'doc_xxx'},
+            'redirect_url': {'description': 'URL de retour après fermeture du viewer', 'example_value': 'https://formulaires.example.com/demande/42/'},
+            'expired': {'description': 'Date d\'expiration de l\'URL (ISO 8601)', 'example_value': '2026-12-31T23:59:59Z'},
+        },
     )
     def get_viewer_url(self, request, **kwargs):
         payload = self._parse_payload(request, **kwargs)
@@ -571,8 +618,13 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='download-signed-documents', perm='can_access', methods=['get'],
-        description=_('Télécharge les documents signés d\'un workflow terminé.'),
-        parameters={'workflow_id': {'description': 'ID du workflow', 'example_value': 'wfl_xxx'}},
+        description=_('Télécharge les documents signés d\'un workflow terminé (status=finished). '
+                      'Retourne un flux binaire PDF ou ZIP (si plusieurs documents). '
+                      'Header Content-Disposition avec le nom du fichier.'),
+        parameters={
+            'workflow_id': {'description': 'ID du workflow Goodflag (doit être terminé)', 'example_value': 'wfl_xxx'},
+            'external_ref': {'description': 'Ou référence externe Publik', 'example_value': '81-1'},
+        },
     )
     def download_signed_documents(self, request, **kwargs):
         workflow_id = self._require_workflow_id(self._parse_payload(request, **kwargs))

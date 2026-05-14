@@ -153,6 +153,8 @@ def _build_workflow_payload(payload, resource):
             for r in step.get('recipients', []):
                 if not r.get('consentPageId') and default_consent:
                     r['consentPageId'] = default_consent
+                for empty_key in [k for k, v in list(r.items()) if v in (None, '', '{{ }}')]:
+                    del r[empty_key]
     else:
         built = []
         for r in recipients:

@@ -209,16 +209,16 @@ Cas d'usage : un responsable **valide** le document, puis deux signataires le **
 curl -s -X POST .../submit-workflow \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "Convention recherche INSA-Industriel 2026",
+    "name": "Convention recherche Labo-Industriel 2026",
     "steps": [
       {
         "stepType": "approval",
         "recipients": [
           {
-            "email": "directeur.labo@insa-lyon.fr",
+            "email": "directeur.labo@example.com",
             "firstName": "Marie",
             "lastName": "Curie",
-            "consentPageId": "cop_ApprobationLaboINSA"
+            "consentPageId": "cop_ApprobationLabo"
           }
         ],
         "maxInvites": 3
@@ -227,7 +227,7 @@ curl -s -X POST .../submit-workflow \
         "stepType": "signature",
         "recipients": [
           {
-            "email": "chercheur@insa-lyon.fr",
+            "email": "chercheur@example.com",
             "firstName": "Pierre",
             "lastName": "Martin",
             "phoneNumber": "+33611111111",
@@ -244,14 +244,14 @@ curl -s -X POST .../submit-workflow \
         "maxInvites": 5
       }
     ],
-    "signature_profile_id": "sip_ProfilOTPSMS_INSA",
-    "layout_id": "lay_MetadataINSA",
+    "signature_profile_id": "sip_ProfilOTPSMS",
+    "layout_id": "lay_MetadataDefault",
     "metadata": {
       "data1": "{{ form_number }}",
       "data2": "Convention recherche",
       "data3": "Laboratoire CITI"
     },
-    "file_url": "https://formulaires.insa.pbelledent.cloud/convention/1/download?f=2",
+    "file_url": "https://formulaires.example.com/convention/1/download?f=2",
     "content_type": "application/pdf"
   }'
 ```
@@ -259,7 +259,7 @@ curl -s -X POST .../submit-workflow \
 **Explication du circuit :**
 
 1. **Étape 1 — Approbation** (`stepType: approval`) :  
-   Le directeur de labo reçoit un email, visualise le document et approuve (pas de signature électronique, juste une validation). La page de consentement `cop_ApprobationLaboINSA` affiche les conditions d'approbation spécifiques.
+   Le directeur de labo reçoit un email, visualise le document et approuve (pas de signature électronique, juste une validation). La page de consentement `cop_ApprobationLabo` affiche les conditions d'approbation spécifiques.
 
 2. **Étape 2 — Signature** (`stepType: signature`) :  
    Une fois l'approbation donnée, les deux signataires reçoivent simultanément une invitation. Chacun signe avec OTP SMS (code envoyé sur leur téléphone). La page `cop_SignatureOTPSMS` affiche les mentions légales de signature électronique.
@@ -298,7 +298,7 @@ Paramètres POST :
   recipients_1_lastname  = {{ form_var_nom_industriel }}
   recipients_1_phone     = {{ form_var_tel_industriel }}
   recipients_1_consent_page_id = cop_SignatureOTPSMS
-  signature_profile_id   = sip_ProfilOTPSMS_INSA
+  signature_profile_id   = sip_ProfilOTPSMS
   external_ref           = {{ form_number }}
 ```
 

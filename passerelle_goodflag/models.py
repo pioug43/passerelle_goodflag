@@ -388,8 +388,16 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='create-workflow', perm='can_access', methods=['post'],
-        description=_('Crée un workflow de signature Goodflag (statut draft, sans document). '
-                      'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "draft"}}'),
+        description=_(
+            'Crée un workflow de signature Goodflag (statut draft, sans document).\n\n'
+            'Exemple requête JSON :\n'
+            '{"name": "Convention de stage 2026-001", '
+            '"recipient_email": "signataire@example.com", '
+            '"recipient_firstname": "Jean", "recipient_lastname": "Dupont", '
+            '"recipient_phone": "+33612345678"}\n\n'
+            'Réponse :\n'
+            '{"data": {"workflow_id": "wfl_K49wUU...", "status": "draft"}}'
+        ),
         parameters={
             'name': {'description': 'Nom/objet du workflow (obligatoire)', 'example_value': 'Convention de stage 2026-001'},
             'recipient_email': {'description': 'Email du signataire (format simple)', 'example_value': 'signataire@example.com'},
@@ -415,9 +423,31 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='submit-workflow', perm='can_access', methods=['post'],
-        description=_('Pipeline complet en un appel : crée le workflow, uploade le document (PDF/DOCX/image) '
-                      'et démarre les invitations. '
-                      'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "started", "document_id": "doc_xxx"}}'),
+        description=_(
+            'Pipeline complet en un appel : crée le workflow, uploade le document (PDF/DOCX/image) '
+            'et démarre les invitations.\n\n'
+            'Exemple requête JSON :\n'
+            '{"name": "Convention de stage 2026", '
+            '"recipient_email": "signataire@example.com", '
+            '"recipient_firstname": "Jean", "recipient_lastname": "Dupont", '
+            '"recipient_phone": "+33612345678", '
+            '"file_url": "https://formulaires.example.com/demande/42/download?f=2", '
+            '"content_type": "application/pdf", '
+            '"external_ref": "81-1"}\n\n'
+            'Exemple avec DOCX :\n'
+            '{"name": "Contrat", "recipient_email": "...", '
+            '"file_url": "https://.../download?f=3", '
+            '"content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}\n\n'
+            'Exemple multi-signataires :\n'
+            '{"name": "Convention tripartite", '
+            '"recipients_0_email": "alice@example.com", "recipients_0_firstname": "Alice", '
+            '"recipients_0_phone": "+33611111111", '
+            '"recipients_1_email": "bob@example.com", "recipients_1_firstname": "Bob", '
+            '"recipients_1_phone": "+33622222222", '
+            '"file_url": "https://.../download?f=2"}\n\n'
+            'Réponse :\n'
+            '{"data": {"workflow_id": "wfl_CpW8YQ...", "status": "started", "document_id": "doc_2Z1HFN..."}}'
+        ),
         parameters={
             'name': {'description': 'Nom/objet du workflow (obligatoire)', 'example_value': 'Convention de stage 2026'},
             'recipient_email': {'description': 'Email du signataire', 'example_value': 'signataire@example.com'},
@@ -462,8 +492,20 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='upload-document', perm='can_access', methods=['post'],
-        description=_('Upload un document (PDF, DOCX, JPEG, PNG, WebP) dans un workflow existant en draft. '
-                      'Taille max : 50 Mo. Les DOCX sont convertis en PDF côté Goodflag.'),
+        description=_(
+            'Upload un document (PDF, DOCX, JPEG, PNG, WebP) dans un workflow existant en draft. '
+            'Taille max : 50 Mo. Les DOCX sont convertis en PDF côté Goodflag.\n\n'
+            'Exemple via file_url :\n'
+            '{"workflow_id": "wfl_xxx", '
+            '"file_url": "https://formulaires.example.com/demande/42/download?f=2", '
+            '"filename": "convention.pdf", "content_type": "application/pdf"}\n\n'
+            'Exemple via base64 :\n'
+            '{"workflow_id": "wfl_xxx", "file_base64": "<base64>", '
+            '"filename": "contrat.docx", '
+            '"content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}\n\n'
+            'Réponse :\n'
+            '{"data": {"workflow_id": "wfl_xxx", "document_id": "doc_xxx", "filename": "convention.pdf"}}'
+        ),
         parameters={
             'workflow_id': {'description': 'ID du workflow Goodflag (ou external_ref)', 'example_value': 'wfl_xxx'},
             'file_url': {'description': 'URL HTTPS du document Publik', 'example_value': 'https://formulaires.example.com/demande/42/download?f=2'},
@@ -487,8 +529,11 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='start-workflow', perm='can_access', methods=['post'],
-        description=_('Démarre un workflow en draft → envoie les invitations email aux signataires. '
-                      'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "started"}}'),
+        description=_(
+            'Démarre un workflow en draft → envoie les invitations email aux signataires.\n\n'
+            'Exemple : {"workflow_id": "wfl_xxx"}\n\n'
+            'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "started"}}'
+        ),
         parameters={
             'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
             'external_ref': {'description': 'Ou référence externe (alternative à workflow_id)', 'example_value': '81-1'},
@@ -500,8 +545,12 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='stop-workflow', perm='can_access', methods=['post'],
-        description=_('Arrête un workflow en cours. Le statut passe à "stopped" (normalisé : "refused"). '
-                      'Les invitations en attente sont annulées.'),
+        description=_(
+            'Arrête un workflow en cours. Le statut passe à "stopped" (normalisé : "refused"). '
+            'Les invitations en attente sont annulées.\n\n'
+            'Exemple : {"workflow_id": "wfl_xxx"}\n\n'
+            'Réponse : {"data": {"workflow_id": "wfl_xxx", "status": "stopped"}}'
+        ),
         parameters={
             'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
             'external_ref': {'description': 'Ou référence externe', 'example_value': '81-1'},
@@ -513,8 +562,12 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='resend-invite', perm='can_access', methods=['post'],
-        description=_('Renvoie une invitation par email à un destinataire (relance). '
-                      'Utile si le signataire n\'a pas reçu ou a perdu l\'email initial.'),
+        description=_(
+            'Renvoie une invitation par email à un destinataire (relance). '
+            'Utile si le signataire n\'a pas reçu ou a perdu l\'email initial.\n\n'
+            'Exemple : {"workflow_id": "wfl_xxx", "recipient_email": "signataire@example.com"}\n\n'
+            'Réponse : {"data": {"invite_url": "https://...", "workflow_id": "wfl_xxx"}}'
+        ),
         parameters={
             'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
             'recipient_email': {'description': 'Email du destinataire à relancer (obligatoire)', 'example_value': 'signataire@example.com'},
@@ -530,9 +583,18 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='sync-status', perm='can_access', methods=['get'],
-        description=_('Statut normalisé pour polling WCS. Statuts : draft, started, finished, refused, error. '
-                      'is_final=true quand finished ou refused. Cache 10s pour limiter le polling. '
-                      'Réponse : {"data": {"workflow_id":"...", "status":"started", "progress":50, "is_final":false}}'),
+        description=_(
+            'Statut normalisé pour polling WCS. Cache 10s.\n'
+            'Statuts possibles : draft → started → finished | refused | error.\n\n'
+            'Exemple appel : ?workflow_id=wfl_xxx\n'
+            'Ou via référence : ?external_ref=81-1\n\n'
+            'Réponse (en cours) :\n'
+            '{"data": {"workflow_id": "wfl_xxx", "raw_status": "started", '
+            '"status": "started", "progress": 50, "is_final": false}}\n\n'
+            'Réponse (terminé) :\n'
+            '{"data": {"workflow_id": "wfl_xxx", "raw_status": "finished", '
+            '"status": "finished", "progress": 100, "is_final": true}}'
+        ),
         parameters={
             'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
             'external_ref': {'description': 'Référence externe Publik (alternative à workflow_id)', 'example_value': '81-1'},
@@ -552,8 +614,14 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='list-workflows', perm='can_access', methods=['get'],
-        description=_('Liste et recherche les workflows Goodflag (pagination, tri par date décroissante). '
-                      'Cache 15s. Réponse : {"data": {"total":42, "items":[{"workflow_id":"...", "name":"...", "status":"..."}]}}'),
+        description=_(
+            'Liste et recherche les workflows Goodflag (pagination, tri par date décroissante). Cache 15s.\n\n'
+            'Exemple : ?text=Convention&per_page=10\n\n'
+            'Réponse :\n'
+            '{"data": {"total": 42, "page": 0, "per_page": 10, "items": ['
+            '{"workflow_id": "wfl_xxx", "name": "Convention stage", "status": "started", '
+            '"progress": 50, "created": "2026-05-14T13:26:54Z"}]}}'
+        ),
         parameters={
             'text': {'description': 'Recherche texte sur nom et métadonnées', 'example_value': 'Convention stage'},
             'page': {'description': 'Index de page (0-based, défaut: 0)', 'example_value': '0'},
@@ -584,8 +652,14 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='get-workflow', perm='can_access', methods=['get'],
-        description=_('Détail complet d\'un workflow : statut brut Goodflag, étapes, destinataires, progression. '
-                      'Réponse : {"data": {"workflow_id":"...", "status":"...", "normalized_status":"...", "steps":[...]}}'),
+        description=_(
+            'Détail complet d\'un workflow : statut, étapes, destinataires, progression.\n\n'
+            'Exemple : ?workflow_id=wfl_xxx\n\n'
+            'Réponse :\n'
+            '{"data": {"workflow_id": "wfl_xxx", "status": "started", '
+            '"normalized_status": "started", "name": "Convention stage", '
+            '"progress": 50, "steps": [{"stepType": "signature", "recipients": [...]}]}}'
+        ),
         parameters={
             'workflow_id': {'description': 'ID du workflow Goodflag', 'example_value': 'wfl_xxx'},
             'external_ref': {'description': 'Ou référence externe Publik', 'example_value': '81-1'},
@@ -597,8 +671,13 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='get-viewer-url', perm='can_access', methods=['get', 'post'],
-        description=_('Génère une URL temporaire de visualisation d\'un document dans le navigateur '
-                      '(lecture seule, pas de signature). Réponse : {"data": {"viewer_url": "https://..."}}'),
+        description=_(
+            'Génère une URL temporaire de visualisation d\'un document (lecture seule, pas de signature).\n\n'
+            'Exemple : ?document_id=doc_xxx\n'
+            'Avec retour : ?document_id=doc_xxx&redirect_url=https://formulaires.example.com/demande/42/\n\n'
+            'Réponse :\n'
+            '{"data": {"viewer_url": "https://goodflag.com/viewer/...", "document_id": "doc_xxx"}}'
+        ),
         parameters={
             'document_id': {'description': 'ID du document Goodflag (obligatoire)', 'example_value': 'doc_xxx'},
             'redirect_url': {'description': 'URL de retour après fermeture du viewer', 'example_value': 'https://formulaires.example.com/demande/42/'},
@@ -618,9 +697,13 @@ class GoodflagResource(BaseResource):
 
     @endpoint(
         name='download-signed-documents', perm='can_access', methods=['get'],
-        description=_('Télécharge les documents signés d\'un workflow terminé (status=finished). '
-                      'Retourne un flux binaire PDF ou ZIP (si plusieurs documents). '
-                      'Header Content-Disposition avec le nom du fichier.'),
+        description=_(
+            'Télécharge les documents signés d\'un workflow terminé (status=finished). '
+            'Retourne un flux binaire PDF ou ZIP (si plusieurs documents).\n\n'
+            'Exemple : ?workflow_id=wfl_xxx\n\n'
+            'Réponse : flux binaire avec Content-Disposition: attachment; filename="signed_documents.pdf"\n'
+            'Pas de wrapper JSON — le fichier est retourné directement.'
+        ),
         parameters={
             'workflow_id': {'description': 'ID du workflow Goodflag (doit être terminé)', 'example_value': 'wfl_xxx'},
             'external_ref': {'description': 'Ou référence externe Publik', 'example_value': '81-1'},

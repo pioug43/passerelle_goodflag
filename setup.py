@@ -7,11 +7,11 @@ with open(os.path.join(os.path.dirname(__file__), 'README.md'), encoding='utf-8'
 
 setup(
     name='passerelle-goodflag',
-    version='1.4.0',
+    version='2.1.0',
     description='Connecteur Passerelle pour la signature électronique Goodflag',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    author='INSA Lyon',
+    author='Pierrick Belledent',
     author_email='pierrick.belledent@insa-lyon.fr',
     url='https://github.com',
     license='AGPLv3+',

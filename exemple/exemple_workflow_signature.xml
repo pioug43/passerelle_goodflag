@@ -40,7 +40,7 @@ des champs backoffice, un seul statut d'attente qui vérifie le statut
         -->
         <item type="webservice_call" id="2">
           <method>POST</method>
-          <url>{{ passerelle_url }}passerelle-goodflag/goodflag/submit-workflow</url>
+          <url>{{ passerelle_url }}passerelle-goodflag/signature/submit-workflow</url>
           <post>False</post>
           <post_data>
             <item>
@@ -125,7 +125,7 @@ des champs backoffice, un seul statut d'attente qui vérifie le statut
         <!-- Appel sync-status à chaque entrée dans ce statut -->
         <item type="webservice_call" id="7">
           <method>GET</method>
-          <url>{{ passerelle_url }}passerelle-goodflag/goodflag/sync-status?workflow_id={{ form_var_goodflag_workflow_id }}&amp;external_ref={{ form_number }}</url>
+          <url>{{ passerelle_url }}passerelle-goodflag/signature/sync-status?workflow_id={{ form_var_goodflag_workflow_id }}&amp;external_ref={{ form_number }}</url>
           <post>False</post>
           <response_type>json</response_type>
           <varname>goodflag_status</varname>
@@ -188,7 +188,7 @@ des champs backoffice, un seul statut d'attente qui vérifie le statut
 
         <item type="webservice_call" id="11">
           <method>GET</method>
-          <url>{{ passerelle_url }}passerelle-goodflag/goodflag/download-signed-documents?workflow_id={{ form_var_goodflag_workflow_id }}&amp;external_ref={{ form_number }}</url>
+          <url>{{ passerelle_url }}passerelle-goodflag/signature/download-signed-documents?workflow_id={{ form_var_goodflag_workflow_id }}&amp;external_ref={{ form_number }}</url>
           <post>False</post>
           <response_type>attachment</response_type>
           <varname>document_signe</varname>
